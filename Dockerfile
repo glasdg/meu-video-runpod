@@ -4,6 +4,7 @@ FROM nvidia/cuda:12.2.2-runtime-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,video,utility
 
 # 1. Instalar FFmpeg (com libass para legendas estilizadas .ASS/.SRT), Python, fontes e utilitários
 RUN apt-get update && apt-get install -y --no-install-recommends \

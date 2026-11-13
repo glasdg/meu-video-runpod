@@ -58,14 +58,21 @@ def download_file(url: str, dest_path: str, timeout: int = 180) -> str:
         return dest_path
 
     headers = {"User-Agent": "RunPod-VideoRenderer/1.0"}
-    with requests.get(url, stream=True, timeout=timeout, headers=headers) as r:
+    with requests.get(url, stream=True, timeout=timeout, headers=headers, allow_redirects=True) as r:
         r.raise_for_status()
+        ctype = (r.headers.get("Content-Type") or "").lower()
+        if "text/html" in ctype:
+            raise RuntimeError(f"URL retornou página HTML em vez de mídia ({url[:80]})")
         with open(dest_path, "wb") as f:
             for chunk in r.iter_content(chunk_size=1024 * 512):
                 if chunk:
                     f.write(chunk)
     if os.path.getsize(dest_path) == 0:
         raise RuntimeError(f"Arquivo baixado vazio: {url}")
+    with open(dest_path, "rb") as f:
+        head = f.read(64).lstrip().lower()
+        if head.startswith(b"<!doctype") or head.startswith(b"<html"):
+            raise RuntimeError(f"Arquivo baixado é HTML inválido ({url[:80]})")
     return dest_path
 
 
@@ -106,8 +113,9 @@ def get_overlay_filter_expr(overlay: str, width: int, height: int) -> str:
 def build_ken_burns_filter(movement: str, duration: float, fps: int, width: int, height: int) -> str:
     frames = max(2, int(math.ceil(duration * fps)))
     mov = (movement or "none").lower()
-    # Primeiro ajusta imagem para cobrir exatamente 2x a resolução (evita tremores do zoompan)
-    pre = f"scale={width*2}:{height*2}:force_original_aspect_ratio=increase,crop={width*2}:{height*2},setsar=1"
+    pre_w = min(int(width * 1.4), 2688)
+    pre_h = min(int(height * 1.4), 1512) if width >= height else min(int(height * 1.4), 2688)
+    pre = f"scale={pre_w}:{pre_h}:force_original_aspect_ratio=increase,crop={pre_w}:{pre_h},setsar=1"
     if mov == "zoom_in":
         zp = f"zoompan=z='min(zoom+0.0012,1.25)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={frames}:s={width}x{height}:fps={fps}"
     elif mov == "zoom_out":
@@ -178,21 +186,7 @@ def upload_to_callback(file_path: str, callback_url: str) -> str | None:
 
 
 def upload_to_temp_cloud(file_path: str) -> str | None:
-    # Fallback 1: litterbox.catbox.moe (até 1GB, dura 72h)
-    try:
-        with open(file_path, "rb") as f:
-            r = requests.post(
-                "https://litterbox.catbox.moe/resources/internals/api.php",
-                data={"reqtype": "fileupload", "time": "72h"},
-                files={"fileToUpload": ("video_renderizado.mp4", f, "video/mp4")},
-                timeout=300,
-            )
-        if r.ok and r.text.strip().startswith("http"):
-            return r.text.strip()
-    except Exception as e:
-        print(f"[RunPod] litterbox fallback falhou: {e}")
-
-    # Fallback 2: tmpfiles.org
+    # Fallback 1: tmpfiles.org
     try:
         with open(file_path, "rb") as f:
             r = requests.post(
@@ -206,6 +200,35 @@ def upload_to_temp_cloud(file_path: str) -> str | None:
                 return url.replace("tmpfiles.org/", "tmpfiles.org/dl/")
     except Exception as e:
         print(f"[RunPod] tmpfiles fallback falhou: {e}")
+
+    # Fallback 2: uguu.se
+    try:
+        with open(file_path, "rb") as f:
+            r = requests.post(
+                "https://uguu.se/upload.php",
+                files={"files[]": ("video_renderizado.mp4", f, "video/mp4")},
+                timeout=300,
+            )
+        if r.ok:
+            files = r.json().get("files", [])
+            if files and files[0].get("url"):
+                return files[0]["url"]
+    except Exception as e:
+        print(f"[RunPod] uguu fallback falhou: {e}")
+
+    # Fallback 3: litterbox.catbox.moe
+    try:
+        with open(file_path, "rb") as f:
+            r = requests.post(
+                "https://litterbox.catbox.moe/resources/internals/api.php",
+                data={"reqtype": "fileupload", "time": "72h"},
+                files={"fileToUpload": ("video_renderizado.mp4", f, "video/mp4")},
+                timeout=300,
+            )
+        if r.ok and r.text.strip().startswith("http"):
+            return r.text.strip()
+    except Exception as e:
+        print(f"[RunPod] litterbox fallback falhou: {e}")
 
     return None
 
@@ -309,20 +332,18 @@ def handler(job):
             ], "Gerar tela preta inicial")
             segment_files.append(black_seg)
 
-        for idx, clip in enumerate(clips):
+        def render_single_clip(idx: int, clip: dict) -> str:
             dur = max(0.2, float(clip.get("duration", 3.0)))
             seg_out = os.path.join(work_dir, f"seg_{idx+1:04d}.mp4")
             src_path = clip_paths.get(idx)
 
             if not src_path or not os.path.exists(src_path):
-                # Fallback tela preta se mídia não existir ou for clipe de vídeo reservado
                 run_cmd([
                     "ffmpeg", "-y",
                     "-f", "lavfi", "-i", f"color=c=black:s={width}x{height}:r={fps}:d={dur:.3f}",
                     *v_enc_args, "-an", seg_out
                 ], f"Clipe {idx+1} (tela preta)")
-                segment_files.append(seg_out)
-                continue
+                return seg_out
 
             vf_parts = []
             if clip.get("type") == "video":
@@ -354,7 +375,17 @@ def handler(job):
                 "-an",
                 seg_out
             ], f"Renderizar clipe {idx+1}/{len(clips)}")
-            segment_files.append(seg_out)
+            return seg_out
+
+        rendered_by_idx = {}
+        with ThreadPoolExecutor(max_workers=4 if use_nvenc else 2) as rpool:
+            rfuts = {rpool.submit(render_single_clip, idx, clip): idx for idx, clip in enumerate(clips)}
+            for fut in as_completed(rfuts):
+                c_idx = rfuts[fut]
+                rendered_by_idx[c_idx] = fut.result()
+
+        for idx in range(len(clips)):
+            segment_files.append(rendered_by_idx[idx])
 
         if not segment_files:
             return {"error": "Nenhum segmento de vídeo pôde ser gerado."}
