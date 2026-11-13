@@ -11,6 +11,7 @@ import json
 import uuid
 import math
 import time
+import random
 import shutil
 import base64
 import tempfile
@@ -18,6 +19,13 @@ import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 import runpod
+
+try:
+    import numpy as np
+    import cv2
+    HAS_OPENCV = True
+except Exception:
+    HAS_OPENCV = False
 
 # ==============================================================================
 # UTILITÁRIOS
@@ -79,17 +87,19 @@ def download_file(url: str, dest_path: str, timeout: int = 180) -> str:
 def get_visual_filter_expr(visual_filter: str) -> str:
     vf = (visual_filter or "none").lower()
     mapping = {
-        "cinematic": "eq=contrast=1.12:saturation=0.88:brightness=-0.02,colorbalance=rs=-0.03:bs=0.05",
-        "vintage": "colorchannelmixer=.393:.769:.189:0:.349:.686:.168:0:.272:.534:.131,eq=contrast=0.95:brightness=0.03",
-        "bw": "hue=s=0,eq=contrast=1.1",
-        "noir": "hue=s=0,eq=contrast=1.45:brightness=-0.06",
-        "neon": "eq=saturation=1.6:contrast=1.25",
-        "pastel": "eq=saturation=0.65:brightness=0.08:contrast=0.92",
-        "warm": "colorbalance=rs=0.08:gs=0.02:bs=-0.06,eq=saturation=1.15",
-        "high_contrast": "eq=contrast=1.35:saturation=1.1",
-        "dream": "gblur=sigma=0.6,eq=brightness=0.06:saturation=1.12",
-        "sepia_old": "colorchannelmixer=.393:.769:.189:0:.349:.686:.168:0:.272:.534:.131,eq=contrast=1.08",
-        "technicolor": "eq=saturation=1.45:contrast=1.2,colorbalance=rs=0.05:gs=-0.02:bs=0.04",
+        "cinematic": "eq=contrast=1.10:saturation=1.20:brightness=-0.05",
+        "vintage": "colorchannelmixer=.393:.769:.189:0:.349:.686:.168:0:.272:.534:.131,eq=contrast=1.15:brightness=-0.04",
+        "bw": "hue=s=0,eq=contrast=1.20",
+        "noir": "hue=s=0,eq=contrast=1.50:brightness=-0.10",
+        "cyberpunk": "eq=contrast=1.30:saturation=1.50:brightness=0.05,hue=h=-30",
+        "neon": "eq=saturation=2.0:contrast=1.40,hue=h=45",
+        "pastel": "eq=saturation=0.70:brightness=0.08:contrast=0.90",
+        "warm": "colorbalance=rs=0.08:gs=0.03:bs=-0.06,eq=saturation=1.20:contrast=1.10",
+        "cool": "colorbalance=rs=-0.06:gs=0.02:bs=0.08,eq=saturation=0.85:contrast=1.10:brightness=0.04",
+        "high_contrast": "eq=contrast=1.50:saturation=1.10",
+        "dream": "gblur=sigma=1.2,eq=brightness=0.08:saturation=1.20",
+        "sepia_old": "colorchannelmixer=.393:.769:.189:0:.349:.686:.168:0:.272:.534:.131,eq=contrast=1.25:brightness=-0.06:saturation=0.80",
+        "technicolor": "eq=saturation=2.0:contrast=1.15:brightness=0.03,hue=h=5",
     }
     return mapping.get(vf, "")
 
@@ -99,7 +109,7 @@ def get_overlay_filter_expr(overlay: str, width: int, height: int) -> str:
     if ov == "vignette":
         return "vignette=PI/4"
     elif ov == "letterbox":
-        bar_h = max(20, int(height * 0.11))
+        bar_h = max(20, int(height * 0.12))
         return f"drawbox=x=0:y=0:w={width}:h={bar_h}:color=black:t=fill,drawbox=x=0:y={height - bar_h}:w={width}:h={bar_h}:color=black:t=fill"
     elif ov in ("film_grain", "vhs"):
         return "noise=alls=14:allf=t+u"
@@ -107,27 +117,236 @@ def get_overlay_filter_expr(overlay: str, width: int, height: int) -> str:
         return "drawgrid=w=0:h=4:t=1:c=black@0.35"
     elif ov == "blood_screen":
         return "vignette=PI/3,colorbalance=rs=0.14:gs=-0.04:bs=-0.04"
+    elif ov == "dream":
+        return "gblur=sigma=0.8,eq=brightness=0.06"
     return ""
+
+
+def compute_capcut_transform(
+    movement: str,
+    camera_effect: str,
+    progress: float,
+    width: int,
+    height: int,
+    duration: float,
+    rng: random.Random,
+):
+    """Espelha exatamente getKenBurnsTransform de FinalizarVideo.tsx (com ciclo ping-pong de 8s)."""
+    scale = 1.0
+    tx = 0.0
+    ty = 0.0
+
+    effective_progress = progress
+    if duration > 8.0:
+        cycle_duration = 8.0
+        current_seconds = progress * duration
+        cycle_phase = (current_seconds / cycle_duration) % 2.0
+        effective_progress = cycle_phase if cycle_phase <= 1.0 else (2.0 - cycle_phase)
+
+    mov = (movement or "none").lower()
+    if mov == "zoom_in":
+        scale = 1.0 + 0.15 * effective_progress
+    elif mov == "zoom_out":
+        scale = 1.15 - 0.15 * effective_progress
+    elif mov == "pan_left":
+        scale = 1.2
+        tx = width * 0.05 - width * 0.1 * effective_progress
+    elif mov == "pan_right":
+        scale = 1.2
+        tx = -(width * 0.05) + width * 0.1 * effective_progress
+    elif mov == "pan_up":
+        scale = 1.2
+        ty = height * 0.05 - height * 0.1 * effective_progress
+    elif mov == "pan_down":
+        scale = 1.2
+        ty = -(height * 0.05) + height * 0.1 * effective_progress
+
+    t = progress * duration
+    ce = (camera_effect or "none").lower()
+    if ce == "handheld":
+        tx += math.sin(t * 3.0) * (width * 0.01) + math.cos(t * 4.5) * (width * 0.005)
+        ty += math.cos(t * 2.5) * (height * 0.01) + math.sin(t * 5.0) * (height * 0.005)
+        scale *= 1.05
+    elif ce == "shake":
+        tx += (rng.random() - 0.5) * (width * 0.005)
+        ty += (rng.random() - 0.5) * (height * 0.005)
+        scale *= 1.02
+    elif ce == "earthquake":
+        tx += (rng.random() - 0.5) * (width * 0.02)
+        ty += (rng.random() - 0.5) * (height * 0.02)
+        scale *= 1.1
+    elif ce == "float":
+        tx += math.sin(t * 1.0) * (width * 0.03)
+        ty += math.cos(t * 0.8) * (height * 0.02)
+        scale *= 1.05
+    elif ce == "pulse":
+        scale *= 1.0 + math.sin(t * 8.0) * 0.03
+    elif ce == "rock":
+        tx += math.sin(t * 1.5) * (width * 0.01)
+        ty += math.cos(t * 3.0) * (height * 0.005)
+
+    return scale, tx, ty
+
+
+def build_affine_matrix(
+    src_w: int,
+    src_h: int,
+    width: int,
+    height: int,
+    scale: float,
+    tx: float,
+    ty: float,
+    custom_transform: dict | None,
+):
+    img_ratio = src_w / float(max(1, src_h))
+    canvas_ratio = width / float(max(1, height))
+    if img_ratio > canvas_ratio:
+        draw_w = float(width)
+        draw_h = float(src_h) * (width / float(max(1, src_w)))
+    else:
+        draw_h = float(height)
+        draw_w = float(src_w) * (height / float(max(1, src_h)))
+
+    t_fit = np.array([
+        [draw_w / float(max(1, src_w)), 0.0, -draw_w / 2.0],
+        [0.0, draw_h / float(max(1, src_h)), -draw_h / 2.0],
+        [0.0, 0.0, 1.0],
+    ], dtype=np.float64)
+
+    t_kb = np.array([
+        [scale, 0.0, tx],
+        [0.0, scale, ty],
+        [0.0, 0.0, 1.0],
+    ], dtype=np.float64)
+
+    ct = custom_transform or {}
+    scale_ratio = width / 1280.0
+    cx = (width / 2.0) + float(ct.get("x", 0.0) or 0.0) * scale_ratio
+    cy = (height / 2.0) + float(ct.get("y", 0.0) or 0.0) * scale_ratio
+    csx = float(ct.get("scaleX", 1.0) or 1.0)
+    csy = float(ct.get("scaleY", 1.0) or 1.0)
+    rot_rad = math.radians(float(ct.get("rotation", 0.0) or 0.0))
+    cos_r = math.cos(rot_rad)
+    sin_r = math.sin(rot_rad)
+
+    t_custom = np.array([
+        [csx * cos_r, -csy * sin_r, cx],
+        [csx * sin_r, csy * cos_r, cy],
+        [0.0, 0.0, 1.0],
+    ], dtype=np.float64)
+
+    mat = t_custom @ t_kb @ t_fit
+    return mat[:2, :]
+
+
+def render_clip_with_opencv(
+    idx: int,
+    clip: dict,
+    src_path: str,
+    seg_out: str,
+    width: int,
+    height: int,
+    fps: int,
+    dur: float,
+    vf_post_parts: list[str],
+    v_enc_args: list[str],
+) -> None:
+    """Renderiza clipe usando OpenCV warpAffine sub-pixel (zero tremor) + FFmpeg NVENC/x264."""
+    is_video = clip.get("type") == "video"
+    movement = clip.get("movement", "none")
+    camera_effect = clip.get("cameraEffect", "none")
+    custom_transform = clip.get("customTransform")
+    speed = float(clip.get("playbackSpeed", 1.0) or 1.0)
+    total_frames = max(2, int(round(dur * fps)))
+
+    ff_cmd = [
+        "ffmpeg", "-y",
+        "-f", "rawvideo",
+        "-pix_fmt", "bgr24",
+        "-s", f"{width}x{height}",
+        "-r", str(fps),
+        "-i", "pipe:0",
+    ]
+    if vf_post_parts:
+        ff_cmd.extend(["-vf", ",".join(vf_post_parts)])
+    ff_cmd.extend([*v_enc_args, "-an", seg_out])
+
+    proc = subprocess.Popen(ff_cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    rng = random.Random(10007 * (idx + 1))
+
+    try:
+        if not is_video:
+            img = cv2.imread(src_path, cv2.IMREAD_COLOR)
+            if img is None:
+                raise RuntimeError(f"OpenCV não conseguiu abrir imagem: {src_path}")
+            src_h, src_w = img.shape[:2]
+            for f_idx in range(total_frames):
+                progress = f_idx / float(max(1, total_frames - 1))
+                scale, tx, ty = compute_capcut_transform(movement, camera_effect, progress, width, height, dur, rng)
+                mat = build_affine_matrix(src_w, src_h, width, height, scale, tx, ty, custom_transform)
+                frame = cv2.warpAffine(img, mat, (width, height), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0))
+                proc.stdin.write(frame.tobytes())
+        else:
+            cap = cv2.VideoCapture(src_path)
+            if not cap.isOpened():
+                raise RuntimeError(f"OpenCV não conseguiu abrir vídeo: {src_path}")
+            vid_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+            vid_frames = []
+            while True:
+                ok, frm = cap.read()
+                if not ok:
+                    break
+                vid_frames.append(frm)
+            cap.release()
+            if not vid_frames:
+                raise RuntimeError(f"Vídeo sem frames legíveis: {src_path}")
+            src_h, src_w = vid_frames[0].shape[:2]
+            n_vid = len(vid_frames)
+            for f_idx in range(total_frames):
+                progress = f_idx / float(max(1, total_frames - 1))
+                t_sec = f_idx / float(fps)
+                src_frame_idx = int((t_sec * speed) * vid_fps) % n_vid
+                scale, tx, ty = compute_capcut_transform(movement, camera_effect, progress, width, height, dur, rng)
+                mat = build_affine_matrix(src_w, src_h, width, height, scale, tx, ty, custom_transform)
+                frame = cv2.warpAffine(vid_frames[src_frame_idx], mat, (width, height), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0))
+                proc.stdin.write(frame.tobytes())
+    finally:
+        try:
+            if proc.stdin:
+                proc.stdin.close()
+        except Exception:
+            pass
+
+    _, stderr_bytes = proc.communicate()
+    if proc.returncode != 0:
+        err_tail = (stderr_bytes or b"").decode("utf-8", errors="ignore")[-2000:]
+        raise RuntimeError(f"Erro OpenCV+FFmpeg clipe {idx+1} (code {proc.returncode}):\n{err_tail}")
 
 
 def build_ken_burns_filter(movement: str, duration: float, fps: int, width: int, height: int) -> str:
     frames = max(2, int(math.ceil(duration * fps)))
     mov = (movement or "none").lower()
-    pre_w = min(int(width * 1.4), 2688)
-    pre_h = min(int(height * 1.4), 1512) if width >= height else min(int(height * 1.4), 2688)
+    # Fallback FFmpeg puro caso OpenCV não esteja instalado: 3x supersampling + ciclo 8s ping-pong
+    pre_w = min(int(width * 3), 3840)
+    pre_h = min(int(height * 3), 2160) if width >= height else min(int(height * 3), 3840)
     pre = f"scale={pre_w}:{pre_h}:force_original_aspect_ratio=increase,crop={pre_w}:{pre_h},setsar=1"
+    if duration > 8.0:
+        p_expr = f"if(lte(mod(on/{fps}/8,2),1),mod(on/{fps}/8,2),2-mod(on/{fps}/8,2))"
+    else:
+        p_expr = f"(on/{frames})"
+
     if mov == "zoom_in":
-        zp = f"zoompan=z='min(zoom+0.0012,1.25)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={frames}:s={width}x{height}:fps={fps}"
+        zp = f"zoompan=z='1+0.15*{p_expr}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={frames}:s={width}x{height}:fps={fps}"
     elif mov == "zoom_out":
-        zp = f"zoompan=z='if(lte(on,1),1.25,max(1.0,zoom-0.0012))':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={frames}:s={width}x{height}:fps={fps}"
+        zp = f"zoompan=z='1.15-0.15*{p_expr}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={frames}:s={width}x{height}:fps={fps}"
     elif mov == "pan_left":
-        zp = f"zoompan=z='1.18':x='(iw-iw/zoom)*(1-on/{frames})':y='ih/2-(ih/zoom/2)':d={frames}:s={width}x{height}:fps={fps}"
+        zp = f"zoompan=z='1.2':x='iw/2-(iw/zoom/2)-(iw*(0.05-0.1*{p_expr})/1.2)':y='ih/2-(ih/zoom/2)':d={frames}:s={width}x{height}:fps={fps}"
     elif mov == "pan_right":
-        zp = f"zoompan=z='1.18':x='(iw-iw/zoom)*(on/{frames})':y='ih/2-(ih/zoom/2)':d={frames}:s={width}x{height}:fps={fps}"
+        zp = f"zoompan=z='1.2':x='iw/2-(iw/zoom/2)-(-iw*0.05+iw*0.1*{p_expr})/1.2':y='ih/2-(ih/zoom/2)':d={frames}:s={width}x{height}:fps={fps}"
     elif mov == "pan_up":
-        zp = f"zoompan=z='1.18':x='iw/2-(iw/zoom/2)':y='(ih-ih/zoom)*(1-on/{frames})':d={frames}:s={width}x{height}:fps={fps}"
+        zp = f"zoompan=z='1.2':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)-(ih*(0.05-0.1*{p_expr})/1.2)':d={frames}:s={width}x{height}:fps={fps}"
     elif mov == "pan_down":
-        zp = f"zoompan=z='1.18':x='iw/2-(iw/zoom/2)':y='(ih-ih/zoom)*(on/{frames})':d={frames}:s={width}x{height}:fps={fps}"
+        zp = f"zoompan=z='1.2':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)-(-ih*0.05+ih*0.1*{p_expr})/1.2':d={frames}:s={width}x{height}:fps={fps}"
     else:
         return f"scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},setsar=1,fps={fps}"
 
@@ -385,6 +604,30 @@ def handler(job):
                 ], f"Clipe {idx+1} (tela preta)")
                 return seg_out
 
+            vf_post_parts = []
+            vis_filter = get_visual_filter_expr(clip.get("visualFilter", "none"))
+            if vis_filter:
+                vf_post_parts.append(vis_filter)
+
+            ov_filter = get_overlay_filter_expr(clip.get("overlayEffect", "none"), width, height)
+            if ov_filter:
+                vf_post_parts.append(ov_filter)
+
+            movement = clip.get("movement", "none")
+            camera_effect = clip.get("cameraEffect", "none")
+            custom_transform = clip.get("customTransform")
+            needs_motion = (
+                (movement and movement != "none")
+                or (camera_effect and camera_effect != "none")
+                or bool(custom_transform)
+            )
+
+            if HAS_OPENCV and (clip.get("type") != "video" or needs_motion):
+                render_clip_with_opencv(
+                    idx, clip, src_path, seg_out, width, height, fps, dur, vf_post_parts, v_enc_args
+                )
+                return seg_out
+
             vf_parts = []
             if clip.get("type") == "video":
                 speed = float(clip.get("playbackSpeed", 1.0) or 1.0)
@@ -393,18 +636,11 @@ def handler(job):
                 vf_parts.append(f"scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},setsar=1,fps={fps}")
                 input_args = ["-stream_loop", "-1", "-i", src_path, "-t", f"{dur:.3f}"]
             else:
-                kb = build_ken_burns_filter(clip.get("movement", "none"), dur, fps, width, height)
+                kb = build_ken_burns_filter(movement, dur, fps, width, height)
                 vf_parts.append(kb)
                 input_args = ["-loop", "1", "-i", src_path, "-t", f"{dur:.3f}"]
 
-            vis_filter = get_visual_filter_expr(clip.get("visualFilter", "none"))
-            if vis_filter:
-                vf_parts.append(vis_filter)
-
-            ov_filter = get_overlay_filter_expr(clip.get("overlayEffect", "none"), width, height)
-            if ov_filter:
-                vf_parts.append(ov_filter)
-
+            vf_parts.extend(vf_post_parts)
             vf_str = ",".join([p for p in vf_parts if p])
 
             run_cmd([
