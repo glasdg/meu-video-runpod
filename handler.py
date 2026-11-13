@@ -185,52 +185,92 @@ def upload_to_callback(file_path: str, callback_url: str) -> str | None:
     return None
 
 
-def upload_to_temp_cloud(file_path: str) -> str | None:
-    # Fallback 1: tmpfiles.org
+def upload_to_temp_cloud(file_path: str, job_id: str = "job") -> tuple[str | None, list[str]]:
+    errors = []
+    size_mb = round(os.path.getsize(file_path) / (1024 * 1024), 2)
+
+    # 1. filebin.net (suporta arquivos pesados / multi-GB via stream direto)
     try:
+        bin_id = f"rp_{str(job_id)[:10]}_{int(time.time())}"
+        fb_url = f"https://filebin.net/{bin_id}/video_{str(job_id)[:8]}.mp4"
         with open(file_path, "rb") as f:
             r = requests.post(
-                "https://tmpfiles.org/api/v1/upload",
-                files={"file": ("video_renderizado.mp4", f, "video/mp4")},
-                timeout=300,
+                fb_url,
+                data=f,
+                headers={
+                    "Content-Type": "video/mp4",
+                    "Accept": "application/json",
+                    "cid": f"rp-{job_id}",
+                    "User-Agent": "RunPod-VideoRenderer/1.0",
+                },
+                timeout=600,
             )
-        if r.ok:
-            url = r.json().get("data", {}).get("url", "")
-            if url:
-                return url.replace("tmpfiles.org/", "tmpfiles.org/dl/")
+        if r.status_code in (200, 201):
+            print(f"[RunPod] Upload filebin.net concluído ({size_mb} MB): {fb_url}")
+            return fb_url, errors
+        errors.append(f"filebin:{r.status_code}:{r.text[:120]}")
     except Exception as e:
-        print(f"[RunPod] tmpfiles fallback falhou: {e}")
+        errors.append(f"filebin:{e}")
+        print(f"[RunPod] filebin fallback falhou: {e}")
 
-    # Fallback 2: uguu.se
-    try:
-        with open(file_path, "rb") as f:
-            r = requests.post(
-                "https://uguu.se/upload.php",
-                files={"files[]": ("video_renderizado.mp4", f, "video/mp4")},
-                timeout=300,
-            )
-        if r.ok:
-            files = r.json().get("files", [])
-            if files and files[0].get("url"):
-                return files[0]["url"]
-    except Exception as e:
-        print(f"[RunPod] uguu fallback falhou: {e}")
+    # 2. qu.ax (até 256 MB)
+    if size_mb <= 250:
+        try:
+            with open(file_path, "rb") as f:
+                r = requests.post(
+                    "https://qu.ax/upload.php",
+                    files={"files[]": ("video_renderizado.mp4", f, "video/mp4")},
+                    headers={"User-Agent": "RunPod-VideoRenderer/1.0"},
+                    timeout=300,
+                )
+            if r.ok:
+                files = r.json().get("files", [])
+                if files and files[0].get("url"):
+                    return files[0]["url"], errors
+            errors.append(f"quax:{r.status_code}:{r.text[:120]}")
+        except Exception as e:
+            errors.append(f"quax:{e}")
+            print(f"[RunPod] qu.ax fallback falhou: {e}")
 
-    # Fallback 3: litterbox.catbox.moe
-    try:
-        with open(file_path, "rb") as f:
-            r = requests.post(
-                "https://litterbox.catbox.moe/resources/internals/api.php",
-                data={"reqtype": "fileupload", "time": "72h"},
-                files={"fileToUpload": ("video_renderizado.mp4", f, "video/mp4")},
-                timeout=300,
-            )
-        if r.ok and r.text.strip().startswith("http"):
-            return r.text.strip()
-    except Exception as e:
-        print(f"[RunPod] litterbox fallback falhou: {e}")
+    # 3. uguu.se (até 128 MB)
+    if size_mb <= 125:
+        try:
+            with open(file_path, "rb") as f:
+                r = requests.post(
+                    "https://uguu.se/upload.php",
+                    files={"files[]": ("video_renderizado.mp4", f, "video/mp4")},
+                    headers={"User-Agent": "RunPod-VideoRenderer/1.0"},
+                    timeout=300,
+                )
+            if r.ok:
+                files = r.json().get("files", [])
+                if files and files[0].get("url"):
+                    return files[0]["url"], errors
+            errors.append(f"uguu:{r.status_code}:{r.text[:120]}")
+        except Exception as e:
+            errors.append(f"uguu:{e}")
+            print(f"[RunPod] uguu fallback falhou: {e}")
 
-    return None
+    # 4. tmpfiles.org (até 100 MB)
+    if size_mb <= 98:
+        try:
+            with open(file_path, "rb") as f:
+                r = requests.post(
+                    "https://tmpfiles.org/api/v1/upload",
+                    files={"file": ("video_renderizado.mp4", f, "video/mp4")},
+                    headers={"User-Agent": "RunPod-VideoRenderer/1.0"},
+                    timeout=300,
+                )
+            if r.ok:
+                url = r.json().get("data", {}).get("url", "")
+                if url:
+                    return url.replace("tmpfiles.org/", "tmpfiles.org/dl/"), errors
+            errors.append(f"tmpfiles:{r.status_code}:{r.text[:120]}")
+        except Exception as e:
+            errors.append(f"tmpfiles:{e}")
+            print(f"[RunPod] tmpfiles fallback falhou: {e}")
+
+    return None, errors
 
 
 # ==============================================================================
@@ -552,8 +592,9 @@ def handler(job):
             video_url = upload_to_callback(final_output_path, callback_upload_url)
             delivery_method = "callback"
 
+        upload_errors = []
         if not video_url:
-            video_url = upload_to_temp_cloud(final_output_path)
+            video_url, upload_errors = upload_to_temp_cloud(final_output_path, job_id)
             delivery_method = "temp_cloud"
 
         result = {
@@ -568,12 +609,13 @@ def handler(job):
 
         if video_url:
             result["videoUrl"] = video_url
-        elif size_mb <= 8.0:
+        elif size_mb <= 12.0:
             with open(final_output_path, "rb") as f:
                 result["videoBase64"] = base64.b64encode(f.read()).decode("utf-8")
             result["deliveryMethod"] = "base64"
         else:
-            return {"error": "Vídeo gerado com sucesso, mas não foi possível fazer upload (>8MB). Configure S3/R2 ou use um app com URL pública."}
+            err_detail = " | ".join(upload_errors) if upload_errors else "Sem host disponível"
+            return {"error": f"Vídeo gerado ({size_mb} MB em {elapsed}s), mas o upload falhou: {err_detail}. Configure S3/R2 nas variáveis do Endpoint."}
 
         return result
 
