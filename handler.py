@@ -323,6 +323,446 @@ def render_clip_with_opencv(
         raise RuntimeError(f"Erro OpenCV+FFmpeg clipe {idx+1} (code {proc.returncode}):\n{err_tail}")
 
 
+def _hex_to_bgr(hex_str: str, default=(255, 255, 255)) -> tuple[int, int, int]:
+    s = (hex_str or "").strip().lstrip("#")
+    if len(s) == 3:
+        s = "".join(c * 2 for c in s)
+    if len(s) < 6:
+        return default
+    try:
+        r = int(s[0:2], 16)
+        g = int(s[2:4], 16)
+        b = int(s[4:6], 16)
+        return (b, g, r)
+    except Exception:
+        return default
+
+
+def compute_character_anim(animation: str, t: float, width: int, height: int):
+    """Espelha exatamente as 14 animações de personagem de FinalizarVideo.tsx."""
+    dx = 0.0
+    dy = 0.0
+    d_scale = 1.0
+    d_rot = 0.0
+    d_opacity = 1.0
+
+    # Proporciona deslocamentos em px para 1080x1920 / 4K manterem a mesma amplitude visual da prévia
+    px_scale = max(1.0, min(width, height) / 720.0)
+    anim = (animation or "none").lower()
+
+    if anim == "floating":
+        dy = -10.0 * px_scale * (1.0 - math.cos(t * math.pi))
+    elif anim == "jumping":
+        dy = -10.0 * px_scale * (1.0 - math.cos(t * math.pi * 2.0))
+    elif anim == "breathing":
+        d_scale = 1.0 + 0.025 * (1.0 - math.cos((t * math.pi * 2.0) / 3.0))
+    elif anim == "sliding":
+        phase = (t % 3.0) / 3.0
+        if phase < 0.25:
+            dx = 4.0 * px_scale * (phase / 0.25)
+            dy = dx
+            d_rot = 2.0 * (phase / 0.25)
+        elif phase < 0.5:
+            dx = (4.0 - 8.0 * ((phase - 0.25) / 0.25)) * px_scale
+            dy = dx
+            d_rot = 2.0 - 4.0 * ((phase - 0.25) / 0.25)
+        elif phase < 0.75:
+            dx = (-4.0 + 8.0 * ((phase - 0.5) / 0.25)) * px_scale
+            dy = -4.0 * px_scale
+            d_rot = -2.0 + 4.0 * ((phase - 0.5) / 0.25)
+        else:
+            dx = (4.0 - 4.0 * ((phase - 0.75) / 0.25)) * px_scale
+            dy = (-4.0 + 4.0 * ((phase - 0.75) / 0.25)) * px_scale
+            d_rot = 2.0 - 2.0 * ((phase - 0.75) / 0.25)
+    elif anim == "wobble":
+        d_rot = 4.0 * math.cos((t * math.pi * 2.0) / 1.5)
+    elif anim == "zoom_pulse":
+        d_scale = 1.0 + 0.025 * (1.0 - math.cos(t * math.pi))
+    elif anim == "swinging":
+        d_rot = 4.0 * math.cos(t * math.pi)
+    elif anim == "shaking":
+        phase = (t % 0.2) / 0.2
+        if phase < 0.25:
+            dx, dy, d_rot = 4.0 * px_scale, 4.0 * px_scale, 2.0
+        elif phase < 0.5:
+            dx, dy, d_rot = -4.0 * px_scale, -4.0 * px_scale, -2.0
+        elif phase < 0.75:
+            dx, dy, d_rot = 4.0 * px_scale, -4.0 * px_scale, 2.0
+    elif anim == "slide_in":
+        if t < 1.0:
+            dy = (1.0 - t) * height
+            d_opacity = max(0.0, min(1.0, t))
+    elif anim == "bobbing":
+        dy = -10.0 * px_scale * (1.0 - math.cos((t * math.pi * 2.0) / 1.5))
+    elif anim == "zoom_in_slow":
+        d_scale = (1.0 + 0.2 * (t / 10.0)) if t < 10.0 else 1.2
+    elif anim == "pulsing":
+        d_scale = 1.0 + 0.025 * (1.0 - math.cos(t * math.pi * 2.0))
+    elif anim == "pop_up":
+        if t < 0.075:
+            d_scale = max(0.01, (t / 0.075) * 1.1)
+            d_opacity = max(0.0, min(1.0, t / 0.075))
+        elif t < 0.125:
+            d_scale = 1.1 - 0.1 * ((t - 0.075) / 0.05)
+    elif anim == "glitch":
+        phase = (t % 0.2) / 0.2
+        if 0.2 < phase < 0.4:
+            dx, dy = -4.0 * px_scale, 2.0 * px_scale
+        elif 0.4 <= phase < 0.6:
+            dx, dy = 4.0 * px_scale, -2.0 * px_scale
+        elif 0.6 <= phase < 0.8:
+            dx, dy = -2.0 * px_scale, 4.0 * px_scale
+        elif phase >= 0.8:
+            dx, dy = 2.0 * px_scale, -4.0 * px_scale
+
+    return dx, dy, d_scale, d_rot, d_opacity
+
+
+def build_character_bg_and_effect_layers(
+    width: int,
+    height: int,
+    bg_type: str,
+    bg_color: str,
+    bg_img_path: str | None,
+    ef_type: str,
+    ef_radius: float,
+    ef_color: str,
+    ef_opacity: float,
+    ef_margin: float,
+    ef_border_width: float,
+):
+    """Pré-calcula (bg_layer BGRA uint8, effect_layer BGRA float32, glass_mask float32|None)."""
+    scale_ref = max(1.0, min(width, height) / 720.0)
+    bg_layer = None
+
+    bt = (bg_type or "transparent").lower()
+    if bt == "color":
+        bgr = _hex_to_bgr(bg_color or "#000000", (0, 0, 0))
+        bg_layer = np.zeros((height, width, 4), dtype=np.uint8)
+        bg_layer[:, :, :3] = bgr
+        bg_layer[:, :, 3] = 255
+    elif bt == "image" and bg_img_path and os.path.exists(bg_img_path):
+        raw_bg = cv2.imread(bg_img_path, cv2.IMREAD_COLOR)
+        if raw_bg is not None:
+            bh0, bw0 = raw_bg.shape[:2]
+            bg_ratio = bw0 / float(max(1, bh0))
+            canvas_ratio = width / float(max(1, height))
+            if bg_ratio > canvas_ratio:
+                nh = height
+                nw = int(round(bw0 * (height / float(max(1, bh0)))))
+            else:
+                nw = width
+                nh = int(round(bh0 * (width / float(max(1, bw0)))))
+            resized_bg = cv2.resize(raw_bg, (max(1, nw), max(1, nh)), interpolation=cv2.INTER_LINEAR)
+            x0 = max(0, (nw - width) // 2)
+            y0 = max(0, (nh - height) // 2)
+            crop_bg = resized_bg[y0:y0 + height, x0:x0 + width]
+            if crop_bg.shape[0] == height and crop_bg.shape[1] == width:
+                bg_layer = np.zeros((height, width, 4), dtype=np.uint8)
+                bg_layer[:, :, :3] = crop_bg
+                bg_layer[:, :, 3] = 255
+
+    ef = (ef_type or "none").lower()
+    if ef == "none":
+        return bg_layer, None, None
+
+    margin_px = max(0.0, float(ef_margin) * scale_ref)
+    ef_w = max(2.0, width - margin_px * 2.0)
+    ef_h = max(2.0, height - margin_px * 2.0)
+    max_rad = min(ef_w, ef_h) / 2.0
+    rad = max(0.0, min(float(ef_radius) * scale_ref, max_rad))
+    op = max(0.0, min(1.0, float(ef_opacity) / 100.0))
+    bw = max(0.0, float(ef_border_width) * scale_ref)
+    bgr_ef = np.array(_hex_to_bgr(ef_color or "#ffffff", (255, 255, 255)), dtype=np.float32)
+
+    yy, xx = np.mgrid[0:height, 0:width].astype(np.float32)
+    cx_r = width / 2.0
+    cy_r = height / 2.0
+    qx = np.maximum(np.abs(xx - cx_r) - (ef_w / 2.0) + rad, 0.0)
+    qy = np.maximum(np.abs(yy - cy_r) - (ef_h / 2.0) + rad, 0.0)
+    dist = np.sqrt(qx * qx + qy * qy) - rad
+
+    inside_mask = np.clip(0.5 - dist, 0.0, 1.0)
+    border_mask = np.clip(0.5 - np.abs(dist + bw / 2.0) + bw / 2.0, 0.0, 1.0) if bw > 0 else np.zeros((height, width), dtype=np.float32)
+
+    effect_layer = np.zeros((height, width, 4), dtype=np.float32)
+    glass_mask = None
+
+    def _paint_border(layer_arr, alpha_mult=1.0):
+        if bw > 0:
+            a = border_mask * op * alpha_mult
+            layer_arr[:, :, :3] = np.where(a[:, :, None] > 0.001, bgr_ef, layer_arr[:, :, :3])
+            layer_arr[:, :, 3] = np.maximum(layer_arr[:, :, 3], a)
+
+    if ef == "card_frame":
+        fill_a = inside_mask * op * (0x18 / 255.0)
+        effect_layer[:, :, :3] = bgr_ef
+        effect_layer[:, :, 3] = fill_a
+        _paint_border(effect_layer, 1.0)
+    elif ef == "glassmorphism":
+        glass_mask = inside_mask
+        fill_a = inside_mask * op * (0x20 / 255.0)
+        effect_layer[:, :, :3] = bgr_ef
+        effect_layer[:, :, 3] = fill_a
+        _paint_border(effect_layer, 0x45 / 255.0)
+    elif ef == "glow_border":
+        if bw <= 0:
+            bw_glow = 2.0 * scale_ref
+            border_mask = np.clip(0.5 - np.abs(dist + bw_glow / 2.0) + bw_glow / 2.0, 0.0, 1.0)
+        glow_blur = cv2.GaussianBlur(border_mask, (0, 0), sigmaX=max(4.0, 9.0 * scale_ref))
+        glow_a = np.clip(np.maximum(border_mask, glow_blur * 1.6) * op, 0.0, 1.0)
+        effect_layer[:, :, :3] = bgr_ef
+        effect_layer[:, :, 3] = glow_a
+    elif ef == "vignette":
+        r_dist = np.sqrt((xx - cx_r) ** 2 + (yy - cy_r) ** 2)
+        r0 = ef_w * 0.15
+        r1 = ef_w * 0.6
+        t_v = np.clip((r_dist - r0) / max(1.0, r1 - r0), 0.0, 1.0)
+        effect_layer[:, :, :3] = bgr_ef
+        effect_layer[:, :, 3] = inside_mask * t_v * op
+    elif ef == "inner_shadow":
+        bw_in = max(bw, 4.0 * scale_ref)
+        ring = np.clip(0.5 - np.abs(dist + bw_in / 2.0) + bw_in / 2.0, 0.0, 1.0)
+        glow_in = cv2.GaussianBlur(ring, (0, 0), sigmaX=max(6.0, 12.0 * scale_ref)) * inside_mask
+        effect_layer[:, :, :3] = bgr_ef
+        effect_layer[:, :, 3] = np.clip(np.maximum(ring, glow_in * 1.4) * op, 0.0, 1.0)
+    elif ef == "gradient_overlay":
+        u = np.clip(((xx - (cx_r - ef_w / 2.0)) / ef_w + (yy - (cy_r - ef_h / 2.0)) / ef_h) / 2.0, 0.0, 1.0)
+        # Gradiente: 0 -> efColor@40%, 0.5 -> transparente, 1 -> preto@60%
+        top_w = np.clip((0.5 - u) / 0.5, 0.0, 1.0) * (0x40 / 255.0)
+        bot_w = np.clip((u - 0.5) / 0.5, 0.0, 1.0) * (0x99 / 255.0)
+        grad_a = (top_w + bot_w) * inside_mask * op
+        denom = np.maximum(top_w + bot_w, 1e-5)
+        effect_layer[:, :, :3] = bgr_ef * (top_w / denom)[:, :, None]
+        effect_layer[:, :, 3] = grad_a
+        _paint_border(effect_layer, 0x40 / 255.0)
+    elif ef == "scanlines":
+        step = max(4, int(round(6 * scale_ref)))
+        thick = max(2, int(round(3 * scale_ref)))
+        scan = ((yy.astype(np.int32) - int(cy_r - ef_h / 2.0)) % step < thick).astype(np.float32)
+        effect_layer[:, :, :3] = 0.0
+        effect_layer[:, :, 3] = scan * inside_mask * op * 0.4
+        _paint_border(effect_layer, 0x60 / 255.0)
+    elif ef == "cinema_bars":
+        bar_h = ef_h * 0.10
+        y_top = cy_r - ef_h / 2.0 + bar_h
+        y_bot = cy_r + ef_h / 2.0 - bar_h
+        bars = ((yy <= y_top) | (yy >= y_bot)).astype(np.float32)
+        effect_layer[:, :, :3] = bgr_ef
+        effect_layer[:, :, 3] = bars * inside_mask * op
+        _paint_border(effect_layer, 0x40 / 255.0)
+
+    return bg_layer, effect_layer, glass_mask
+
+
+def composite_characters_opencv(
+    visual_video_path: str,
+    char_out_path: str,
+    valid_chars: list,
+    bg_img_cache: dict,
+    width: int,
+    height: int,
+    fps: int,
+    v_enc_args: list[str],
+):
+    """Composita fundo + efeito + personagem animado em sub-pixel sobre o vídeo."""
+    # Pré-carrega PNGs dos personagens com canal alpha e pré-renderiza camadas de fundo/efeito
+    char_img_cache = {}
+    bg_effect_cache = {}
+    windows = []
+
+    for c_idx, c_path, ch_meta in valid_chars:
+        if c_path not in char_img_cache:
+            c_img = cv2.imread(c_path, cv2.IMREAD_UNCHANGED)
+            if c_img is None:
+                continue
+            if c_img.ndim == 2:
+                c_img = cv2.cvtColor(c_img, cv2.COLOR_GRAY2BGRA)
+            elif c_img.shape[2] == 3:
+                alpha_ch = np.full((c_img.shape[0], c_img.shape[1], 1), 255, dtype=np.uint8)
+                c_img = np.concatenate([c_img, alpha_ch], axis=2)
+            char_img_cache[c_path] = c_img
+
+        bg_key = (
+            ch_meta.get("backgroundType", "transparent"),
+            ch_meta.get("backgroundColor", "#000000"),
+            ch_meta.get("backgroundImageUrl", ""),
+            ch_meta.get("bgEffectType", "none"),
+            ch_meta.get("bgEffectBorderRadius", 16),
+            ch_meta.get("bgEffectColor", "#ffffff"),
+            ch_meta.get("bgEffectOpacity", 80),
+            ch_meta.get("bgEffectMargin", 16),
+            ch_meta.get("bgEffectBorderWidth", 2),
+        )
+        if bg_key not in bg_effect_cache:
+            bg_img_path = bg_img_cache.get(ch_meta.get("backgroundImageUrl", ""))
+            bg_effect_cache[bg_key] = build_character_bg_and_effect_layers(
+                width, height,
+                bg_key[0], bg_key[1], bg_img_path,
+                bg_key[3], bg_key[4], bg_key[5], bg_key[6], bg_key[7], bg_key[8],
+            )
+
+        c_start = float(ch_meta.get("startTime", 0))
+        c_end = c_start + float(ch_meta.get("duration", 10))
+        windows.append((c_start, c_end, char_img_cache[c_path], ch_meta, bg_effect_cache[bg_key]))
+
+    cap = cv2.VideoCapture(visual_video_path)
+    if not cap.isOpened():
+        raise RuntimeError(f"OpenCV não conseguiu abrir vídeo concatenado: {visual_video_path}")
+
+    vid_fps = cap.get(cv2.CAP_PROP_FPS) or float(fps)
+    ff_cmd = [
+        "ffmpeg", "-y",
+        "-f", "rawvideo",
+        "-pix_fmt", "bgr24",
+        "-s", f"{width}x{height}",
+        "-r", f"{vid_fps:.3f}",
+        "-i", "pipe:0",
+        *v_enc_args,
+        "-an",
+        char_out_path,
+    ]
+    proc = subprocess.Popen(ff_cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    scale_ratio = width / 1280.0
+    char_max_h = height * 0.8
+
+    try:
+        f_idx = 0
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            cur_t = f_idx / float(vid_fps)
+            f_idx += 1
+
+            active_win = None
+            for w in windows:
+                if w[0] <= cur_t <= w[1]:
+                    active_win = w
+                    break
+
+            if active_win is not None:
+                c_start, c_end, c_img, ch_meta, (bg_layer, ef_layer, glass_mask) = active_win
+
+                # 1. Fundo do personagem (Cor sólida ou Imagem personalizada)
+                if bg_layer is not None:
+                    frame = bg_layer[:, :, :3].copy()
+
+                # 2. Efeito sobre o fundo (com bordas arredondadas)
+                if glass_mask is not None:
+                    blurred = cv2.GaussianBlur(frame, (0, 0), sigmaX=10.0)
+                    gm = glass_mask[:, :, None]
+                    frame = np.clip(frame.astype(np.float32) * (1.0 - gm) + blurred.astype(np.float32) * gm, 0, 255).astype(np.uint8)
+                if ef_layer is not None:
+                    a = ef_layer[:, :, 3:4]
+                    frame = np.clip(frame.astype(np.float32) * (1.0 - a) + ef_layer[:, :, :3] * a, 0, 255).astype(np.uint8)
+
+                # 3. Personagem animado em sub-pixel (espela FinalizarVideo.tsx)
+                src_h, src_w = c_img.shape[:2]
+                c_scale = max(0.1, min(3.0, float(ch_meta.get("scale", 100)) / 100.0))
+                render_h = char_max_h * c_scale
+                render_w = float(src_w) * (render_h / float(max(1, src_h)))
+
+                pos = str(ch_meta.get("position", "center")).lower()
+                padding = width * 0.02
+                if pos in ("left", "bottom-left"):
+                    cx = -width / 2.0 + padding + render_w / 2.0
+                elif pos in ("right", "bottom-right"):
+                    cx = width / 2.0 - padding - render_w / 2.0
+                else:
+                    cx = 0.0
+
+                if pos.startswith("bottom"):
+                    cy = height / 2.0 - height * 0.05 - render_h / 2.0
+                else:
+                    cy = -height * 0.025
+
+                t_local = cur_t - c_start
+                dx, dy, d_scale, d_rot, d_opacity = compute_character_anim(
+                    ch_meta.get("animation", "none"), t_local, width, height
+                )
+
+                ct = ch_meta.get("customTransform") or {}
+                ct_x = float(ct.get("x", 0.0) or 0.0) * scale_ratio
+                ct_y = float(ct.get("y", 0.0) or 0.0) * scale_ratio
+                ct_sx = float(ct.get("scaleX", 1.0) or 1.0)
+                ct_sy = float(ct.get("scaleY", 1.0) or 1.0)
+                ct_rot = float(ct.get("rotation", 0.0) or 0.0)
+
+                # Matriz exata: Translate(W/2 + cx + dx + ct_x, H/2 + cy + dy + ct_y)
+                #   @ Rotate(d_rot + ct_rot)
+                #   @ Translate(0, render_h/2) @ Scale(d_scale*ct_sx, d_scale*ct_sy) @ Translate(0, -render_h/2)
+                #   @ Fit(src -> -render_w/2..-render_h/2)
+                t_fit = np.array([
+                    [render_w / float(max(1, src_w)), 0.0, -render_w / 2.0],
+                    [0.0, render_h / float(max(1, src_h)), -render_h / 2.0],
+                    [0.0, 0.0, 1.0],
+                ], dtype=np.float64)
+
+                sx_tot = d_scale * ct_sx
+                sy_tot = d_scale * ct_sy
+                t_piv = np.array([
+                    [sx_tot, 0.0, 0.0],
+                    [0.0, sy_tot, (render_h / 2.0) * (1.0 - sy_tot)],
+                    [0.0, 0.0, 1.0],
+                ], dtype=np.float64)
+
+                rad_rot = math.radians(d_rot + ct_rot)
+                cos_r, sin_r = math.cos(rad_rot), math.sin(rad_rot)
+                tx_abs = (width / 2.0) + cx + dx + ct_x
+                ty_abs = (height / 2.0) + cy + dy + ct_y
+                t_world = np.array([
+                    [cos_r, -sin_r, tx_abs],
+                    [sin_r, cos_r, ty_abs],
+                    [0.0, 0.0, 1.0],
+                ], dtype=np.float64)
+
+                mat = (t_world @ t_piv @ t_fit)[:2, :]
+
+                # Recorta ROI delimitadora para compositar apenas onde há personagem
+                corners = np.array([
+                    [0.0, 0.0, 1.0],
+                    [float(src_w), 0.0, 1.0],
+                    [0.0, float(src_h), 1.0],
+                    [float(src_w), float(src_h), 1.0],
+                ], dtype=np.float64).T
+                proj = mat @ corners
+                bx0 = max(0, int(math.floor(np.min(proj[0]))) - 4)
+                by0 = max(0, int(math.floor(np.min(proj[1]))) - 4)
+                bx1 = min(width, int(math.ceil(np.max(proj[0]))) + 4)
+                by1 = min(height, int(math.ceil(np.max(proj[1]))) + 4)
+
+                if bx1 > bx0 and by1 > by0:
+                    roi_mat = mat.copy()
+                    roi_mat[0, 2] -= bx0
+                    roi_mat[1, 2] -= by0
+                    warped_char = cv2.warpAffine(
+                        c_img, roi_mat, (bx1 - bx0, by1 - by0),
+                        flags=cv2.INTER_LINEAR,
+                        borderMode=cv2.BORDER_CONSTANT,
+                        borderValue=(0, 0, 0, 0),
+                    )
+                    alpha_f = (warped_char[:, :, 3:4].astype(np.float32) / 255.0) * d_opacity
+                    roi_frame = frame[by0:by1, bx0:bx1].astype(np.float32)
+                    blended = roi_frame * (1.0 - alpha_f) + warped_char[:, :, :3].astype(np.float32) * alpha_f
+                    frame[by0:by1, bx0:bx1] = np.clip(blended, 0, 255).astype(np.uint8)
+
+            proc.stdin.write(frame.tobytes())
+    finally:
+        cap.release()
+        try:
+            if proc.stdin:
+                proc.stdin.close()
+        except Exception:
+            pass
+
+    _, stderr_bytes = proc.communicate()
+    if proc.returncode != 0:
+        err_tail = (stderr_bytes or b"").decode("utf-8", errors="ignore")[-2000:]
+        raise RuntimeError(f"Erro OpenCV+FFmpeg ao aplicar personagens (code {proc.returncode}):\n{err_tail}")
+
+
 def build_ken_burns_filter(movement: str, duration: float, fps: int, width: int, height: int) -> str:
     frames = max(2, int(math.ceil(duration * fps)))
     mov = (movement or "none").lower()
@@ -680,60 +1120,95 @@ def handler(job):
             visual_video_path
         ], "Concatenar segmentos visuais")
 
-        # 3b. Aplicar overlays de personagem (PIP) se configurados
+        # 3b. Aplicar overlays de personagem (PIP + Animação + Fundo + Efeito) se configurados
         character_overlays = inp.get("characterOverlays", [])
         if character_overlays:
             char_files = {}
+            bg_img_cache = {}
+            url_to_local = {}
             with ThreadPoolExecutor(max_workers=4) as pool:
                 cfuts = {}
                 for c_idx, ch in enumerate(character_overlays):
                     c_url = ch.get("url", "")
                     if c_url:
-                        dest = os.path.join(media_dir, f"char_{c_idx}.png")
-                        cfuts[pool.submit(download_file, c_url, dest)] = (c_idx, dest)
+                        if c_url in url_to_local:
+                            char_files[c_idx] = url_to_local[c_url]
+                        else:
+                            dest = os.path.join(media_dir, f"char_u_{len(url_to_local)}.png")
+                            url_to_local[c_url] = dest
+                            cfuts[pool.submit(download_file, c_url, dest)] = ("char", c_idx, c_url, dest)
+                    bg_url = ch.get("backgroundImageUrl", "")
+                    if bg_url and bg_url not in bg_img_cache:
+                        bg_dest = os.path.join(media_dir, f"char_bg_{len(bg_img_cache)}.png")
+                        bg_img_cache[bg_url] = bg_dest
+                        cfuts[pool.submit(download_file, bg_url, bg_dest)] = ("charbg", c_idx, bg_url, bg_dest)
+
                 for fut in as_completed(cfuts):
-                    c_idx, dest = cfuts[fut]
+                    kind, c_idx, src_url, dest = cfuts[fut]
                     try:
                         fut.result()
-                        char_files[c_idx] = dest
+                        if kind == "char":
+                            char_files[c_idx] = dest
+                        elif kind == "charbg":
+                            bg_img_cache[src_url] = dest
                     except Exception as cerr:
-                        print(f"[RunPod Warning] Falha ao baixar personagem #{c_idx}: {cerr}")
+                        print(f"[RunPod Warning] Falha ao baixar {kind} #{c_idx}: {cerr}")
+                        if kind == "charbg":
+                            bg_img_cache.pop(src_url, None)
+
+            # Preenche entradas repetidas que compartilharam o mesmo URL
+            for c_idx, ch in enumerate(character_overlays):
+                c_url = ch.get("url", "")
+                if c_idx not in char_files and c_url in url_to_local and os.path.exists(url_to_local[c_url]):
+                    char_files[c_idx] = url_to_local[c_url]
 
             valid_chars = [(i, char_files[i], character_overlays[i]) for i in sorted(char_files.keys())]
             if valid_chars:
                 char_out_path = os.path.join(work_dir, "visual_with_chars.mp4")
-                c_cmd = ["ffmpeg", "-y", "-i", visual_video_path]
-                fc_parts = []
-                last_v = "[0:v]"
-                for n_idx, (_, c_path, ch_meta) in enumerate(valid_chars, start=1):
-                    c_cmd.extend(["-i", c_path])
-                    c_start = float(ch_meta.get("startTime", 0))
-                    c_end = c_start + float(ch_meta.get("duration", 5))
-                    c_scale = max(0.15, min(1.5, float(ch_meta.get("scale", 60)) / 100.0))
-                    target_h = int(height * 0.78 * c_scale)
-                    pos = ch_meta.get("position", "center")
-                    if pos in ("left", "bottom-left"):
-                        x_expr = f"{int(width * 0.03)}"
-                    elif pos in ("right", "bottom-right"):
-                        x_expr = f"W-w-{int(width * 0.03)}"
-                    else:
-                        x_expr = "(W-w)/2"
-                    y_expr = "H-h" if str(pos).startswith("bottom") else f"H-h-{int(height * 0.04)}"
+                if HAS_OPENCV:
+                    composite_characters_opencv(
+                        visual_video_path, char_out_path, valid_chars, bg_img_cache, width, height, fps, v_enc_args
+                    )
+                else:
+                    c_cmd = ["ffmpeg", "-y", "-i", visual_video_path]
+                    fc_parts = []
+                    last_v = "[0:v]"
+                    for n_idx, (_, c_path, ch_meta) in enumerate(valid_chars, start=1):
+                        c_cmd.extend(["-i", c_path])
+                        c_start = float(ch_meta.get("startTime", 0))
+                        c_end = c_start + float(ch_meta.get("duration", 10))
+                        c_scale = max(0.1, min(3.0, float(ch_meta.get("scale", 100)) / 100.0))
+                        target_h = int(height * 0.80 * c_scale)
+                        pos = ch_meta.get("position", "center")
+                        anim = str(ch_meta.get("animation", "none")).lower()
+                        if pos in ("left", "bottom-left"):
+                            x_expr = f"{int(width * 0.02)}"
+                        elif pos in ("right", "bottom-right"):
+                            x_expr = f"W-w-{int(width * 0.02)}"
+                        else:
+                            x_expr = "(W-w)/2"
+                        base_y = "H-h" if str(pos).startswith("bottom") else f"(H-h)/2-{int(height * 0.025)}"
+                        if anim in ("floating", "jumping", "bobbing"):
+                            freq = "2*PI" if anim == "jumping" else ("2*PI/1.5" if anim == "bobbing" else "PI")
+                            amp = max(10, int(10 * min(width, height) / 720.0))
+                            y_expr = f"'{base_y}-{amp}*(1-cos((t-{c_start:.2f})*{freq}))'"
+                        else:
+                            y_expr = base_y
 
-                    scaled_lbl = f"[ch{n_idx}]"
-                    out_lbl = "[vchars]" if n_idx == len(valid_chars) else f"[vc{n_idx}]"
-                    fc_parts.append(f"[{n_idx}:v]scale=-1:{target_h}{scaled_lbl}")
-                    fc_parts.append(f"{last_v}{scaled_lbl}overlay=x={x_expr}:y={y_expr}:enable='between(t,{c_start:.2f},{c_end:.2f})'{out_lbl}")
-                    last_v = out_lbl
+                        scaled_lbl = f"[ch{n_idx}]"
+                        out_lbl = "[vchars]" if n_idx == len(valid_chars) else f"[vc{n_idx}]"
+                        fc_parts.append(f"[{n_idx}:v]scale=-1:{target_h}{scaled_lbl}")
+                        fc_parts.append(f"{last_v}{scaled_lbl}overlay=x={x_expr}:y={y_expr}:enable='between(t,{c_start:.2f},{c_end:.2f})'{out_lbl}")
+                        last_v = out_lbl
 
-                c_cmd.extend([
-                    "-filter_complex", ";".join(fc_parts),
-                    "-map", last_v,
-                    *v_enc_args,
-                    "-an",
-                    char_out_path
-                ])
-                run_cmd(c_cmd, "Aplicar personagens PIP")
+                    c_cmd.extend([
+                        "-filter_complex", ";".join(fc_parts),
+                        "-map", last_v,
+                        *v_enc_args,
+                        "-an",
+                        char_out_path
+                    ])
+                    run_cmd(c_cmd, "Aplicar personagens PIP")
                 visual_video_path = char_out_path
 
         # 4. Queimar legendas (.ASS prioritário, fallback .SRT) se fornecidas
