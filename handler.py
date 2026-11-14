@@ -239,6 +239,37 @@ def build_affine_matrix(
     return mat[:2, :]
 
 
+def _close_and_wait_ffmpeg(proc: subprocess.Popen, err_prefix: str) -> None:
+    """Fecha stdin com segurança (evitando ValueError: flush of closed file no proc.communicate) e aguarda FFmpeg."""
+    if proc.stdin is not None:
+        try:
+            if not proc.stdin.closed:
+                proc.stdin.flush()
+        except Exception:
+            pass
+        try:
+            if not proc.stdin.closed:
+                proc.stdin.close()
+        except Exception:
+            pass
+        proc.stdin = None
+
+    stderr_bytes = b""
+    try:
+        if proc.stderr is not None:
+            stderr_bytes = proc.stderr.read() or b""
+            try:
+                proc.stderr.close()
+            except Exception:
+                pass
+    finally:
+        proc.wait()
+
+    if proc.returncode != 0:
+        err_tail = stderr_bytes.decode("utf-8", errors="ignore")[-2000:]
+        raise RuntimeError(f"{err_prefix} (code {proc.returncode}):\n{err_tail}")
+
+
 def render_clip_with_opencv(
     idx: int,
     clip: dict,
@@ -271,7 +302,7 @@ def render_clip_with_opencv(
         ff_cmd.extend(["-vf", ",".join(vf_post_parts)])
     ff_cmd.extend([*v_enc_args, "-an", seg_out])
 
-    proc = subprocess.Popen(ff_cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    proc = subprocess.Popen(ff_cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     rng = random.Random(10007 * (idx + 1))
 
     try:
@@ -285,7 +316,10 @@ def render_clip_with_opencv(
                 scale, tx, ty = compute_capcut_transform(movement, camera_effect, progress, width, height, dur, rng)
                 mat = build_affine_matrix(src_w, src_h, width, height, scale, tx, ty, custom_transform)
                 frame = cv2.warpAffine(img, mat, (width, height), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0))
-                proc.stdin.write(frame.tobytes())
+                try:
+                    proc.stdin.write(frame.tobytes())
+                except BrokenPipeError:
+                    break
         else:
             cap = cv2.VideoCapture(src_path)
             if not cap.isOpened():
@@ -309,18 +343,12 @@ def render_clip_with_opencv(
                 scale, tx, ty = compute_capcut_transform(movement, camera_effect, progress, width, height, dur, rng)
                 mat = build_affine_matrix(src_w, src_h, width, height, scale, tx, ty, custom_transform)
                 frame = cv2.warpAffine(vid_frames[src_frame_idx], mat, (width, height), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0))
-                proc.stdin.write(frame.tobytes())
+                try:
+                    proc.stdin.write(frame.tobytes())
+                except BrokenPipeError:
+                    break
     finally:
-        try:
-            if proc.stdin:
-                proc.stdin.close()
-        except Exception:
-            pass
-
-    _, stderr_bytes = proc.communicate()
-    if proc.returncode != 0:
-        err_tail = (stderr_bytes or b"").decode("utf-8", errors="ignore")[-2000:]
-        raise RuntimeError(f"Erro OpenCV+FFmpeg clipe {idx+1} (code {proc.returncode}):\n{err_tail}")
+        _close_and_wait_ffmpeg(proc, f"Erro OpenCV+FFmpeg clipe {idx+1}")
 
 
 def _hex_to_bgr(hex_str: str, default=(255, 255, 255)) -> tuple[int, int, int]:
@@ -622,7 +650,7 @@ def composite_characters_opencv(
         "-an",
         char_out_path,
     ]
-    proc = subprocess.Popen(ff_cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    proc = subprocess.Popen(ff_cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
     scale_ratio = width / 1280.0
     char_max_h = height * 0.8
@@ -748,19 +776,13 @@ def composite_characters_opencv(
                     blended = roi_frame * (1.0 - alpha_f) + warped_char[:, :, :3].astype(np.float32) * alpha_f
                     frame[by0:by1, bx0:bx1] = np.clip(blended, 0, 255).astype(np.uint8)
 
-            proc.stdin.write(frame.tobytes())
+            try:
+                proc.stdin.write(frame.tobytes())
+            except BrokenPipeError:
+                break
     finally:
         cap.release()
-        try:
-            if proc.stdin:
-                proc.stdin.close()
-        except Exception:
-            pass
-
-    _, stderr_bytes = proc.communicate()
-    if proc.returncode != 0:
-        err_tail = (stderr_bytes or b"").decode("utf-8", errors="ignore")[-2000:]
-        raise RuntimeError(f"Erro OpenCV+FFmpeg ao aplicar personagens (code {proc.returncode}):\n{err_tail}")
+        _close_and_wait_ffmpeg(proc, "Erro OpenCV+FFmpeg ao aplicar personagens")
 
 
 def _ease_in_out(p: float) -> float:
@@ -944,7 +966,7 @@ def concat_with_transitions_opencv(
         "-an",
         out_path,
     ]
-    proc = subprocess.Popen(ff_cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    proc = subprocess.Popen(ff_cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     prev_last_frame = None
 
     try:
@@ -970,28 +992,22 @@ def concat_with_transitions_opencv(
                     frm = cv2.resize(frm, (width, height), interpolation=cv2.INTER_LINEAR)
                 last_valid = frm
 
-                if trans_frames > 0 and f_local < trans_frames and prev_last_frame is not None:
-                    p = (f_local + 1) / float(trans_frames + 1)
-                    out_frm = blend_transition_frames(prev_last_frame, frm, tr_name, p, width, height)
-                    proc.stdin.write(out_frm.tobytes())
-                else:
-                    proc.stdin.write(frm.tobytes())
+                try:
+                    if trans_frames > 0 and f_local < trans_frames and prev_last_frame is not None:
+                        p = (f_local + 1) / float(trans_frames + 1)
+                        out_frm = blend_transition_frames(prev_last_frame, frm, tr_name, p, width, height)
+                        proc.stdin.write(out_frm.tobytes())
+                    else:
+                        proc.stdin.write(frm.tobytes())
+                except BrokenPipeError:
+                    break
                 f_local += 1
 
             cap.release()
             if last_valid is not None:
                 prev_last_frame = last_valid
     finally:
-        try:
-            if proc.stdin:
-                proc.stdin.close()
-        except Exception:
-            pass
-
-    _, stderr_bytes = proc.communicate()
-    if proc.returncode != 0:
-        err_tail = (stderr_bytes or b"").decode("utf-8", errors="ignore")[-2000:]
-        raise RuntimeError(f"Erro ao aplicar transições entre imagens (code {proc.returncode}):\n{err_tail}")
+        _close_and_wait_ffmpeg(proc, "Erro ao aplicar transições entre imagens")
 
 
 def build_ken_burns_filter(movement: str, duration: float, fps: int, width: int, height: int) -> str:
