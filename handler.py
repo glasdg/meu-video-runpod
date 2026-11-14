@@ -763,6 +763,237 @@ def composite_characters_opencv(
         raise RuntimeError(f"Erro OpenCV+FFmpeg ao aplicar personagens (code {proc.returncode}):\n{err_tail}")
 
 
+def _ease_in_out(p: float) -> float:
+    p = max(0.0, min(1.0, p))
+    return p * p * (3.0 - 2.0 * p)
+
+
+def _make_film_burn_mask(width: int, height: int, p: float) -> np.ndarray:
+    """Gera máscara suave de vazamento de luz quente (Film Burn) em BGR float32."""
+    gw, gh = 96, 54
+    xs = np.linspace(0.0, 1.0, gw, dtype=np.float32)[None, :]
+    ys = np.linspace(0.0, 1.0, gh, dtype=np.float32)[:, None]
+    cx = 0.20 + 0.60 * p
+    cy = 0.45
+    dist = np.sqrt((xs - cx) ** 2 + ((ys - cy) * (gh / float(gw))) ** 2)
+    core = np.exp(-(dist ** 2) / (2.0 * (0.24 ** 2)))
+    halo = np.exp(-(dist ** 2) / (2.0 * (0.52 ** 2)))
+    # BGR warm golden/amber core + rich orange halo
+    small = np.zeros((gh, gw, 3), dtype=np.float32)
+    small[:, :, 0] = core * 130.0 + halo * 25.0   # Blue
+    small[:, :, 1] = core * 225.0 + halo * 115.0  # Green
+    small[:, :, 2] = core * 255.0 + halo * 235.0  # Red
+    return cv2.resize(small, (width, height), interpolation=cv2.INTER_LINEAR)
+
+
+def blend_transition_frames(prev_f: np.ndarray, cur_f: np.ndarray, trans: str, p_raw: float, width: int, height: int) -> np.ndarray:
+    """Mistura o último frame do clipe anterior com o frame atual do novo clipe sem alterar a duração total."""
+    p = _ease_in_out(p_raw)
+    tr = (trans or "none").lower()
+
+    if tr == "fade":
+        return cv2.addWeighted(prev_f, 1.0 - p, cur_f, p, 0)
+
+    if tr == "luma_fade":
+        luma = cv2.cvtColor(cur_f, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
+        luma = cv2.GaussianBlur(luma, (15, 15), 0)
+        softness = 0.28
+        cutoff = 1.0 - p * (1.0 + softness)
+        alpha = np.clip((luma - cutoff) / softness, 0.0, 1.0)[..., None]
+        out = prev_f.astype(np.float32) * (1.0 - alpha) + cur_f.astype(np.float32) * alpha
+        return np.clip(out, 0, 255).astype(np.uint8)
+
+    if tr == "film_burn":
+        t = max(0.0, min(1.0, (p - 0.30) / 0.40))
+        base = cv2.addWeighted(prev_f, 1.0 - t, cur_f, t, 0).astype(np.float32)
+        burn_intensity = math.sin(p * math.pi)
+        burn_mask = _make_film_burn_mask(width, height, p) * (0.95 * burn_intensity)
+        # Screen-style additive glow
+        out = 255.0 - ((255.0 - base) * (255.0 - np.clip(burn_mask, 0.0, 255.0)) / 255.0)
+        return np.clip(out, 0, 255).astype(np.uint8)
+
+    if tr == "overexposure":
+        glow = math.sin(p * math.pi)
+        t = max(0.0, min(1.0, (p - 0.42) / 0.16))
+        base = cv2.addWeighted(prev_f, 1.0 - t, cur_f, t, 0).astype(np.float32)
+        gray = cv2.cvtColor(base.astype(np.uint8), cv2.COLOR_BGR2GRAY).astype(np.float32)[..., None]
+        desat = 0.42 * glow
+        mixed = base * (1.0 - desat) + gray * desat
+        out = mixed * (1.0 + 1.85 * glow) + 55.0 * (glow ** 2)
+        return np.clip(out, 0, 255).astype(np.uint8)
+
+    if tr == "split_horizontal":
+        half_w = int(round(p * (width / 2.0)))
+        cx = width // 2
+        left = max(0, cx - half_w)
+        right = min(width, cx + half_w)
+        out = prev_f.copy()
+        if right > left:
+            out[:, left:right] = cur_f[:, left:right]
+        return out
+
+    if tr == "split_vertical":
+        half_h = int(round(p * (height / 2.0)))
+        cy = height // 2
+        top = max(0, cy - half_h)
+        bottom = min(height, cy + half_h)
+        out = prev_f.copy()
+        if bottom > top:
+            out[top:bottom, :] = cur_f[top:bottom, :]
+        return out
+
+    if tr == "flash_white":
+        if p < 0.5:
+            wp = p * 2.0
+            out = prev_f.astype(np.float32) * (1.0 - wp) + 255.0 * wp
+        else:
+            wp = (1.0 - p) * 2.0
+            out = cur_f.astype(np.float32) * (1.0 - wp) + 255.0 * wp
+        return np.clip(out, 0, 255).astype(np.uint8)
+
+    if tr == "flash_black":
+        if p < 0.5:
+            bp = 1.0 - p * 2.0
+            out = prev_f.astype(np.float32) * bp
+        else:
+            bp = (p - 0.5) * 2.0
+            out = cur_f.astype(np.float32) * bp
+        return np.clip(out, 0, 255).astype(np.uint8)
+
+    if tr == "slide_left":
+        dx = int(round(p * width))
+        out = np.zeros_like(cur_f)
+        if dx < width:
+            out[:, :width - dx] = prev_f[:, dx:]
+        if dx > 0:
+            out[:, width - dx:] = cur_f[:, :dx]
+        return out
+
+    if tr == "slide_right":
+        dx = int(round(p * width))
+        out = np.zeros_like(cur_f)
+        if dx < width:
+            out[:, dx:] = prev_f[:, :width - dx]
+        if dx > 0:
+            out[:, :dx] = cur_f[:, width - dx:]
+        return out
+
+    if tr == "slide_up":
+        dy = int(round(p * height))
+        out = np.zeros_like(cur_f)
+        if dy < height:
+            out[:height - dy, :] = prev_f[dy:, :]
+        if dy > 0:
+            out[height - dy:, :] = cur_f[:dy, :]
+        return out
+
+    if tr == "slide_down":
+        dy = int(round(p * height))
+        out = np.zeros_like(cur_f)
+        if dy < height:
+            out[dy:, :] = prev_f[:height - dy, :]
+        if dy > 0:
+            out[:dy, :] = cur_f[height - dy:, :]
+        return out
+
+    if tr == "wipe_left":
+        cut = max(0, min(width, int(round(p * width))))
+        out = prev_f.copy()
+        if cut > 0:
+            out[:, :cut] = cur_f[:, :cut]
+        return out
+
+    if tr in ("zoom_in", "zoom_out"):
+        s_prev = (1.0 + 0.16 * p) if tr == "zoom_in" else max(0.75, 1.0 - 0.15 * p)
+        s_cur = max(0.75, 0.85 + 0.15 * p) if tr == "zoom_in" else (1.18 - 0.18 * p)
+        cx, cy = width / 2.0, height / 2.0
+        m_prev = np.array([[s_prev, 0.0, cx * (1.0 - s_prev)], [0.0, s_prev, cy * (1.0 - s_prev)]], dtype=np.float64)
+        m_cur = np.array([[s_cur, 0.0, cx * (1.0 - s_cur)], [0.0, s_cur, cy * (1.0 - s_cur)]], dtype=np.float64)
+        z_prev = cv2.warpAffine(prev_f, m_prev, (width, height), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+        z_cur = cv2.warpAffine(cur_f, m_cur, (width, height), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+        return cv2.addWeighted(z_prev, 1.0 - p, z_cur, p, 0)
+
+    if tr == "blur":
+        sig_prev = max(0.1, p * 14.0)
+        sig_cur = max(0.1, (1.0 - p) * 14.0)
+        b_prev = cv2.GaussianBlur(prev_f, (0, 0), sigmaX=sig_prev) if sig_prev > 0.5 else prev_f
+        b_cur = cv2.GaussianBlur(cur_f, (0, 0), sigmaX=sig_cur) if sig_cur > 0.5 else cur_f
+        return cv2.addWeighted(b_prev, 1.0 - p, b_cur, p, 0)
+
+    return cur_f
+
+
+def concat_with_transitions_opencv(
+    segment_files: list[str],
+    clip_transitions: list[tuple[str, float]],
+    out_path: str,
+    width: int,
+    height: int,
+    fps: int,
+    v_enc_args: list[str],
+) -> None:
+    """Concatena segmentos aplicando transições opcionais entre clipes sem alterar a duração total."""
+    ff_cmd = [
+        "ffmpeg", "-y",
+        "-f", "rawvideo",
+        "-pix_fmt", "bgr24",
+        "-s", f"{width}x{height}",
+        "-r", str(fps),
+        "-i", "pipe:0",
+        *v_enc_args,
+        "-an",
+        out_path,
+    ]
+    proc = subprocess.Popen(ff_cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    prev_last_frame = None
+
+    try:
+        for seg_idx, seg_path in enumerate(segment_files):
+            cap = cv2.VideoCapture(seg_path)
+            if not cap.isOpened():
+                continue
+
+            tr_name, tr_dur = clip_transitions[seg_idx] if seg_idx < len(clip_transitions) else ("none", 0.0)
+            total_seg_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+            trans_frames = 0
+            if prev_last_frame is not None and tr_name and tr_name != "none" and tr_dur > 0.05:
+                max_safe = max(2, int(total_seg_frames * 0.45)) if total_seg_frames > 0 else int(round(tr_dur * fps))
+                trans_frames = min(max(2, int(round(tr_dur * fps))), max_safe)
+
+            f_local = 0
+            last_valid = None
+            while True:
+                ok, frm = cap.read()
+                if not ok:
+                    break
+                if frm.shape[1] != width or frm.shape[0] != height:
+                    frm = cv2.resize(frm, (width, height), interpolation=cv2.INTER_LINEAR)
+                last_valid = frm
+
+                if trans_frames > 0 and f_local < trans_frames and prev_last_frame is not None:
+                    p = (f_local + 1) / float(trans_frames + 1)
+                    out_frm = blend_transition_frames(prev_last_frame, frm, tr_name, p, width, height)
+                    proc.stdin.write(out_frm.tobytes())
+                else:
+                    proc.stdin.write(frm.tobytes())
+                f_local += 1
+
+            cap.release()
+            if last_valid is not None:
+                prev_last_frame = last_valid
+    finally:
+        try:
+            if proc.stdin:
+                proc.stdin.close()
+        except Exception:
+            pass
+
+    _, stderr_bytes = proc.communicate()
+    if proc.returncode != 0:
+        err_tail = (stderr_bytes or b"").decode("utf-8", errors="ignore")[-2000:]
+        raise RuntimeError(f"Erro ao aplicar transições entre imagens (code {proc.returncode}):\n{err_tail}")
+
+
 def build_ken_burns_filter(movement: str, duration: float, fps: int, width: int, height: int) -> str:
     frames = max(2, int(math.ceil(duration * fps)))
     mov = (movement or "none").lower()
@@ -1106,19 +1337,39 @@ def handler(job):
         if not segment_files:
             return {"error": "Nenhum segmento de vídeo pôde ser gerado."}
 
-        # 3. Concatenar segmentos visuais
-        concat_list_path = os.path.join(work_dir, "concat.txt")
-        with open(concat_list_path, "w", encoding="utf-8") as f:
-            for seg in segment_files:
-                f.write(f"file '{seg}'\n")
+        # 3. Concatenar segmentos visuais (com transições opcionais entre imagens)
+        seg_transitions: list[tuple[str, float]] = []
+        if authentic_intro_secs > 0.05:
+            seg_transitions.append(("none", 0.0))
+        for idx, clip in enumerate(clips):
+            tr_name = str(clip.get("transition") or "none").lower()
+            tr_dur = float(clip.get("transitionDuration") or 0.5)
+            # Primeiro clipe visual (sem clipe anterior real) não precisa de transição
+            if idx == 0 and authentic_intro_secs <= 0.05:
+                seg_transitions.append(("none", 0.0))
+            else:
+                seg_transitions.append((tr_name, tr_dur))
 
+        has_any_transition = any(t[0] not in ("", "none") and t[1] > 0.05 for t in seg_transitions)
         visual_video_path = os.path.join(work_dir, "visual_concat.mp4")
-        run_cmd([
-            "ffmpeg", "-y",
-            "-f", "concat", "-safe", "0", "-i", concat_list_path,
-            "-c", "copy",
-            visual_video_path
-        ], "Concatenar segmentos visuais")
+
+        if has_any_transition and HAS_OPENCV:
+            print(f"[RunPod] Aplicando transições entre clipes ({sum(1 for t in seg_transitions if t[0] != 'none')} cortes)...")
+            concat_with_transitions_opencv(
+                segment_files, seg_transitions, visual_video_path, width, height, fps, v_enc_args
+            )
+        else:
+            concat_list_path = os.path.join(work_dir, "concat.txt")
+            with open(concat_list_path, "w", encoding="utf-8") as f:
+                for seg in segment_files:
+                    f.write(f"file '{seg}'\n")
+
+            run_cmd([
+                "ffmpeg", "-y",
+                "-f", "concat", "-safe", "0", "-i", concat_list_path,
+                "-c", "copy",
+                visual_video_path
+            ], "Concatenar segmentos visuais")
 
         # 3b. Aplicar overlays de personagem (PIP + Animação + Fundo + Efeito) se configurados
         character_overlays = inp.get("characterOverlays", [])
