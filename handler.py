@@ -15,6 +15,7 @@ import random
 import shutil
 import base64
 import tempfile
+import threading
 import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
@@ -239,8 +240,45 @@ def build_affine_matrix(
     return mat[:2, :]
 
 
-def _close_and_wait_ffmpeg(proc: subprocess.Popen, err_prefix: str) -> None:
-    """Fecha stdin com segurança (evitando ValueError: flush of closed file no proc.communicate) e aguarda FFmpeg."""
+def _start_ffmpeg_pipe(ff_cmd: list[str]) -> tuple[subprocess.Popen, list[bytes], threading.Thread]:
+    """Inicia FFmpeg com stdin=PIPE e drena stderr em thread dedicada para nunca travar por buffer de 64KB."""
+    cmd = list(ff_cmd)
+    if len(cmd) >= 1 and cmd[0] == "ffmpeg" and "-loglevel" not in cmd:
+        cmd = [cmd[0], "-loglevel", "error", "-nostats", *cmd[1:]]
+
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        bufsize=1024 * 1024 * 4,
+    )
+    stderr_chunks: list[bytes] = []
+
+    def _drain_stderr():
+        try:
+            if proc.stderr is not None:
+                while True:
+                    chunk = proc.stderr.read(8192)
+                    if not chunk:
+                        break
+                    if len(stderr_chunks) < 64:
+                        stderr_chunks.append(chunk)
+        except Exception:
+            pass
+
+    t = threading.Thread(target=_drain_stderr, daemon=True)
+    t.start()
+    return proc, stderr_chunks, t
+
+
+def _close_and_wait_ffmpeg(
+    proc: subprocess.Popen,
+    stderr_chunks: list[bytes],
+    stderr_thread: threading.Thread,
+    err_prefix: str,
+) -> None:
+    """Fecha stdin com segurança, aguarda FFmpeg e coleta stderr sem risco de flush of closed file ou deadlock."""
     if proc.stdin is not None:
         try:
             if not proc.stdin.closed:
@@ -254,20 +292,90 @@ def _close_and_wait_ffmpeg(proc: subprocess.Popen, err_prefix: str) -> None:
             pass
         proc.stdin = None
 
-    stderr_bytes = b""
+    proc.wait()
+    stderr_thread.join(timeout=5.0)
     try:
-        if proc.stderr is not None:
-            stderr_bytes = proc.stderr.read() or b""
-            try:
-                proc.stderr.close()
-            except Exception:
-                pass
-    finally:
-        proc.wait()
+        if proc.stderr is not None and not proc.stderr.closed:
+            proc.stderr.close()
+    except Exception:
+        pass
 
     if proc.returncode != 0:
-        err_tail = stderr_bytes.decode("utf-8", errors="ignore")[-2000:]
+        err_tail = b"".join(stderr_chunks).decode("utf-8", errors="ignore")[-2000:]
         raise RuntimeError(f"{err_prefix} (code {proc.returncode}):\n{err_tail}")
+
+
+def _resize_oversized_src(img: np.ndarray, width: int, height: int) -> np.ndarray:
+    """Reduz imagens gigantes (ex. 4K+) para ~1.5x o canvas antes do loop frame a frame para acelerar warpAffine."""
+    h, w = img.shape[:2]
+    max_w = int(width * 1.65)
+    max_h = int(height * 1.65)
+    if w > max_w and h > max_h:
+        ratio = max(max_w / float(w), max_h / float(h))
+        nw = max(width, int(round(w * ratio)))
+        nh = max(height, int(round(h * ratio)))
+        return cv2.resize(img, (nw, nh), interpolation=cv2.INTER_AREA)
+    return img
+
+
+def get_prev_clip_end_frame(
+    idx: int,
+    clips: list[dict],
+    clip_paths: dict[int, str],
+    width: int,
+    height: int,
+    authentic_intro_secs: float,
+) -> np.ndarray | None:
+    """Extrai rapidamente apenas o último frame do clipe anterior (sem decodificar o MP4 inteiro) para transições em paralelo."""
+    if idx == 0:
+        if authentic_intro_secs > 0.05:
+            return np.zeros((height, width, 3), dtype=np.uint8)
+        return None
+
+    prev_idx = idx - 1
+    prev_clip = clips[prev_idx]
+    prev_src = clip_paths.get(prev_idx)
+    if not prev_src or not os.path.exists(prev_src):
+        return np.zeros((height, width, 3), dtype=np.uint8)
+
+    prev_dur = max(0.2, float(prev_clip.get("duration", 3.0)))
+    prev_mov = prev_clip.get("movement", "none")
+    prev_cam = prev_clip.get("cameraEffect", "none")
+    prev_ct = prev_clip.get("customTransform")
+    prev_rng = random.Random(10007 * (prev_idx + 1))
+    scale, tx, ty = compute_capcut_transform(prev_mov, prev_cam, 1.0, width, height, prev_dur, prev_rng)
+
+    if prev_clip.get("type") != "video":
+        img = cv2.imread(prev_src, cv2.IMREAD_COLOR)
+        if img is None:
+            return np.zeros((height, width, 3), dtype=np.uint8)
+        img = _resize_oversized_src(img, width, height)
+        src_h, src_w = img.shape[:2]
+        mat = build_affine_matrix(src_w, src_h, width, height, scale, tx, ty, prev_ct)
+        return cv2.warpAffine(img, mat, (width, height), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0))
+
+    cap = cv2.VideoCapture(prev_src)
+    if not cap.isOpened():
+        return np.zeros((height, width, 3), dtype=np.uint8)
+    try:
+        vid_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        n_vid = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        speed = float(prev_clip.get("playbackSpeed", 1.0) or 1.0)
+        target_idx = int((prev_dur * speed) * vid_fps)
+        if n_vid > 0:
+            target_idx = target_idx % n_vid
+            cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, target_idx - 1))
+        ok, frm = cap.read()
+        if not ok or frm is None:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            ok, frm = cap.read()
+        if not ok or frm is None:
+            return np.zeros((height, width, 3), dtype=np.uint8)
+        src_h, src_w = frm.shape[:2]
+        mat = build_affine_matrix(src_w, src_h, width, height, scale, tx, ty, prev_ct)
+        return cv2.warpAffine(frm, mat, (width, height), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0))
+    finally:
+        cap.release()
 
 
 def render_clip_with_opencv(
@@ -281,14 +389,56 @@ def render_clip_with_opencv(
     dur: float,
     vf_post_parts: list[str],
     v_enc_args: list[str],
+    prev_end_frame: np.ndarray | None = None,
+    tr_name: str = "none",
+    tr_dur: float = 0.0,
 ) -> None:
-    """Renderiza clipe usando OpenCV warpAffine sub-pixel (zero tremor) + FFmpeg NVENC/x264."""
+    """Renderiza clipe usando OpenCV warpAffine sub-pixel (zero tremor) + transição de corte opcional + FFmpeg NVENC/x264."""
     is_video = clip.get("type") == "video"
     movement = clip.get("movement", "none")
     camera_effect = clip.get("cameraEffect", "none")
     custom_transform = clip.get("customTransform")
     speed = float(clip.get("playbackSpeed", 1.0) or 1.0)
     total_frames = max(2, int(round(dur * fps)))
+
+    trans_frames = 0
+    if prev_end_frame is not None and tr_name and tr_name != "none" and tr_dur > 0.05:
+        max_safe = max(2, int(total_frames * 0.45))
+        trans_frames = min(max(2, int(round(tr_dur * fps))), max_safe)
+
+    has_motion = (
+        (movement and movement != "none")
+        or (camera_effect and camera_effect != "none")
+    )
+
+    # Atalho ultra-rápido: imagem estática sem transição e sem movimento não precisa enviar centenas de frames pelo pipe
+    if not is_video and not has_motion and trans_frames == 0:
+        img = cv2.imread(src_path, cv2.IMREAD_COLOR)
+        if img is None:
+            raise RuntimeError(f"OpenCV não conseguiu abrir imagem: {src_path}")
+        img = _resize_oversized_src(img, width, height)
+        src_h, src_w = img.shape[:2]
+        mat = build_affine_matrix(src_w, src_h, width, height, 1.0, 0.0, 0.0, custom_transform)
+        static_frame = cv2.warpAffine(img, mat, (width, height), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0))
+        static_png = f"{seg_out}.static.png"
+        cv2.imwrite(static_png, static_frame)
+        try:
+            cmd = [
+                "ffmpeg", "-y", "-loglevel", "error",
+                "-loop", "1", "-framerate", str(fps), "-i", static_png,
+                "-t", f"{dur:.3f}",
+            ]
+            if vf_post_parts:
+                cmd.extend(["-vf", ",".join(vf_post_parts)])
+            cmd.extend([*v_enc_args, "-an", seg_out])
+            run_cmd(cmd, f"Renderizar clipe estático {idx+1}")
+        finally:
+            try:
+                if os.path.exists(static_png):
+                    os.remove(static_png)
+            except Exception:
+                pass
+        return
 
     ff_cmd = [
         "ffmpeg", "-y",
@@ -302,7 +452,7 @@ def render_clip_with_opencv(
         ff_cmd.extend(["-vf", ",".join(vf_post_parts)])
     ff_cmd.extend([*v_enc_args, "-an", seg_out])
 
-    proc = subprocess.Popen(ff_cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    proc, stderr_chunks, stderr_thread = _start_ffmpeg_pipe(ff_cmd)
     rng = random.Random(10007 * (idx + 1))
 
     try:
@@ -310,14 +460,18 @@ def render_clip_with_opencv(
             img = cv2.imread(src_path, cv2.IMREAD_COLOR)
             if img is None:
                 raise RuntimeError(f"OpenCV não conseguiu abrir imagem: {src_path}")
+            img = _resize_oversized_src(img, width, height)
             src_h, src_w = img.shape[:2]
             for f_idx in range(total_frames):
                 progress = f_idx / float(max(1, total_frames - 1))
                 scale, tx, ty = compute_capcut_transform(movement, camera_effect, progress, width, height, dur, rng)
                 mat = build_affine_matrix(src_w, src_h, width, height, scale, tx, ty, custom_transform)
                 frame = cv2.warpAffine(img, mat, (width, height), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0))
+                if trans_frames > 0 and f_idx < trans_frames:
+                    p = (f_idx + 1) / float(trans_frames + 1)
+                    frame = blend_transition_frames(prev_end_frame, frame, tr_name, p, width, height)
                 try:
-                    proc.stdin.write(frame.tobytes())
+                    proc.stdin.write(memoryview(np.ascontiguousarray(frame)))
                 except BrokenPipeError:
                     break
         else:
@@ -343,12 +497,15 @@ def render_clip_with_opencv(
                 scale, tx, ty = compute_capcut_transform(movement, camera_effect, progress, width, height, dur, rng)
                 mat = build_affine_matrix(src_w, src_h, width, height, scale, tx, ty, custom_transform)
                 frame = cv2.warpAffine(vid_frames[src_frame_idx], mat, (width, height), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0))
+                if trans_frames > 0 and f_idx < trans_frames:
+                    p = (f_idx + 1) / float(trans_frames + 1)
+                    frame = blend_transition_frames(prev_end_frame, frame, tr_name, p, width, height)
                 try:
-                    proc.stdin.write(frame.tobytes())
+                    proc.stdin.write(memoryview(np.ascontiguousarray(frame)))
                 except BrokenPipeError:
                     break
     finally:
-        _close_and_wait_ffmpeg(proc, f"Erro OpenCV+FFmpeg clipe {idx+1}")
+        _close_and_wait_ffmpeg(proc, stderr_chunks, stderr_thread, f"Erro OpenCV+FFmpeg clipe {idx+1}")
 
 
 def _hex_to_bgr(hex_str: str, default=(255, 255, 255)) -> tuple[int, int, int]:
@@ -624,11 +781,27 @@ def composite_characters_opencv(
         )
         if bg_key not in bg_effect_cache:
             bg_img_path = bg_img_cache.get(ch_meta.get("backgroundImageUrl", ""))
-            bg_effect_cache[bg_key] = build_character_bg_and_effect_layers(
+            bg_layer, ef_layer, glass_mask = build_character_bg_and_effect_layers(
                 width, height,
                 bg_key[0], bg_key[1], bg_img_path,
                 bg_key[3], bg_key[4], bg_key[5], bg_key[6], bg_key[7], bg_key[8],
             )
+            static_bg_bgr = None
+            ef_inv_u16 = None
+            ef_premult_u16 = None
+            if bg_layer is not None and glass_mask is None:
+                base_f = bg_layer[:, :, :3].astype(np.float32)
+                if ef_layer is not None:
+                    a = ef_layer[:, :, 3:4]
+                    base_f = base_f * (1.0 - a) + ef_layer[:, :, :3] * a
+                static_bg_bgr = np.clip(base_f, 0, 255).astype(np.uint8)
+            elif ef_layer is not None:
+                a_f = ef_layer[:, :, 3:4]
+                ef_inv_u16 = np.clip(np.round((1.0 - a_f) * 256.0), 0, 256).astype(np.uint16)
+                ef_premult_u16 = np.clip(np.round(ef_layer[:, :, :3] * a_f * 256.0), 0, 65535).astype(np.uint16)
+            glass_u16 = np.clip(np.round(glass_mask[:, :, None] * 256.0), 0, 256).astype(np.uint16) if glass_mask is not None else None
+            glass_inv_u16 = (256 - glass_u16) if glass_u16 is not None else None
+            bg_effect_cache[bg_key] = (bg_layer, static_bg_bgr, ef_inv_u16, ef_premult_u16, glass_u16, glass_inv_u16)
 
         c_start = float(ch_meta.get("startTime", 0))
         c_end = c_start + float(ch_meta.get("duration", 10))
@@ -650,7 +823,7 @@ def composite_characters_opencv(
         "-an",
         char_out_path,
     ]
-    proc = subprocess.Popen(ff_cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    proc, stderr_chunks, stderr_thread = _start_ffmpeg_pipe(ff_cmd)
 
     scale_ratio = width / 1280.0
     char_max_h = height * 0.8
@@ -671,20 +844,21 @@ def composite_characters_opencv(
                     break
 
             if active_win is not None:
-                c_start, c_end, c_img, ch_meta, (bg_layer, ef_layer, glass_mask) = active_win
+                c_start, c_end, c_img, ch_meta, (bg_layer, static_bg_bgr, ef_inv_u16, ef_premult_u16, glass_u16, glass_inv_u16) = active_win
 
-                # 1. Fundo do personagem (Cor sólida ou Imagem personalizada)
-                if bg_layer is not None:
-                    frame = bg_layer[:, :, :3].copy()
-
-                # 2. Efeito sobre o fundo (com bordas arredondadas)
-                if glass_mask is not None:
-                    blurred = cv2.GaussianBlur(frame, (0, 0), sigmaX=10.0)
-                    gm = glass_mask[:, :, None]
-                    frame = np.clip(frame.astype(np.float32) * (1.0 - gm) + blurred.astype(np.float32) * gm, 0, 255).astype(np.uint8)
-                if ef_layer is not None:
-                    a = ef_layer[:, :, 3:4]
-                    frame = np.clip(frame.astype(np.float32) * (1.0 - a) + ef_layer[:, :, :3] * a, 0, 255).astype(np.uint8)
+                # 1. Fundo + Efeito otimizados (zero alocação float32 por frame)
+                if static_bg_bgr is not None:
+                    frame = static_bg_bgr.copy()
+                else:
+                    if bg_layer is not None:
+                        frame = bg_layer[:, :, :3].copy()
+                    if glass_u16 is not None:
+                        half = cv2.resize(frame, (max(2, width // 2), max(2, height // 2)), interpolation=cv2.INTER_LINEAR)
+                        blurred_half = cv2.GaussianBlur(half, (0, 0), sigmaX=5.0)
+                        blurred = cv2.resize(blurred_half, (width, height), interpolation=cv2.INTER_LINEAR)
+                        frame = ((frame.astype(np.uint16) * glass_inv_u16 + blurred.astype(np.uint16) * glass_u16) >> 8).astype(np.uint8)
+                    if ef_inv_u16 is not None:
+                        frame = ((frame.astype(np.uint16) * ef_inv_u16 + ef_premult_u16) >> 8).astype(np.uint8)
 
                 # 3. Personagem animado em sub-pixel (espela FinalizarVideo.tsx)
                 src_h, src_w = c_img.shape[:2]
@@ -718,10 +892,6 @@ def composite_characters_opencv(
                 ct_sy = float(ct.get("scaleY", 1.0) or 1.0)
                 ct_rot = float(ct.get("rotation", 0.0) or 0.0)
 
-                # Matriz exata: Translate(W/2 + cx + dx + ct_x, H/2 + cy + dy + ct_y)
-                #   @ Rotate(d_rot + ct_rot)
-                #   @ Translate(0, render_h/2) @ Scale(d_scale*ct_sx, d_scale*ct_sy) @ Translate(0, -render_h/2)
-                #   @ Fit(src -> -render_w/2..-render_h/2)
                 t_fit = np.array([
                     [render_w / float(max(1, src_w)), 0.0, -render_w / 2.0],
                     [0.0, render_h / float(max(1, src_h)), -render_h / 2.0],
@@ -748,7 +918,6 @@ def composite_characters_opencv(
 
                 mat = (t_world @ t_piv @ t_fit)[:2, :]
 
-                # Recorta ROI delimitadora para compositar apenas onde há personagem
                 corners = np.array([
                     [0.0, 0.0, 1.0],
                     [float(src_w), 0.0, 1.0],
@@ -777,12 +946,12 @@ def composite_characters_opencv(
                     frame[by0:by1, bx0:bx1] = np.clip(blended, 0, 255).astype(np.uint8)
 
             try:
-                proc.stdin.write(frame.tobytes())
+                proc.stdin.write(memoryview(np.ascontiguousarray(frame)))
             except BrokenPipeError:
                 break
     finally:
         cap.release()
-        _close_and_wait_ffmpeg(proc, "Erro OpenCV+FFmpeg ao aplicar personagens")
+        _close_and_wait_ffmpeg(proc, stderr_chunks, stderr_thread, "Erro OpenCV+FFmpeg ao aplicar personagens")
 
 
 def _ease_in_out(p: float) -> float:
@@ -966,7 +1135,7 @@ def concat_with_transitions_opencv(
         "-an",
         out_path,
     ]
-    proc = subprocess.Popen(ff_cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    proc, stderr_chunks, stderr_thread = _start_ffmpeg_pipe(ff_cmd)
     prev_last_frame = None
 
     try:
@@ -996,9 +1165,9 @@ def concat_with_transitions_opencv(
                     if trans_frames > 0 and f_local < trans_frames and prev_last_frame is not None:
                         p = (f_local + 1) / float(trans_frames + 1)
                         out_frm = blend_transition_frames(prev_last_frame, frm, tr_name, p, width, height)
-                        proc.stdin.write(out_frm.tobytes())
+                        proc.stdin.write(memoryview(np.ascontiguousarray(out_frm)))
                     else:
-                        proc.stdin.write(frm.tobytes())
+                        proc.stdin.write(memoryview(np.ascontiguousarray(frm)))
                 except BrokenPipeError:
                     break
                 f_local += 1
@@ -1007,7 +1176,7 @@ def concat_with_transitions_opencv(
             if last_valid is not None:
                 prev_last_frame = last_valid
     finally:
-        _close_and_wait_ffmpeg(proc, "Erro ao aplicar transições entre imagens")
+        _close_and_wait_ffmpeg(proc, stderr_chunks, stderr_thread, "Erro ao aplicar transições entre imagens")
 
 
 def build_ken_burns_filter(movement: str, duration: float, fps: int, width: int, height: int) -> str:
@@ -1285,7 +1454,7 @@ def handler(job):
 
             if not src_path or not os.path.exists(src_path):
                 run_cmd([
-                    "ffmpeg", "-y",
+                    "ffmpeg", "-y", "-loglevel", "error",
                     "-f", "lavfi", "-i", f"color=c=black:s={width}x{height}:r={fps}:d={dur:.3f}",
                     *v_enc_args, "-an", seg_out
                 ], f"Clipe {idx+1} (tela preta)")
@@ -1309,9 +1478,30 @@ def handler(job):
                 or bool(custom_transform)
             )
 
-            if HAS_OPENCV and (clip.get("type") != "video" or needs_motion):
+            tr_name = str(clip.get("transition") or "none").lower()
+            tr_dur = float(clip.get("transitionDuration") or 0.5)
+            has_tr_in = (idx > 0 or authentic_intro_secs > 0.05) and tr_name not in ("", "none") and tr_dur > 0.05
+
+            if HAS_OPENCV and (clip.get("type") != "video" or needs_motion or has_tr_in):
+                prev_end_frame = (
+                    get_prev_clip_end_frame(idx, clips, clip_paths, width, height, authentic_intro_secs)
+                    if has_tr_in
+                    else None
+                )
                 render_clip_with_opencv(
-                    idx, clip, src_path, seg_out, width, height, fps, dur, vf_post_parts, v_enc_args
+                    idx,
+                    clip,
+                    src_path,
+                    seg_out,
+                    width,
+                    height,
+                    fps,
+                    dur,
+                    vf_post_parts,
+                    v_enc_args,
+                    prev_end_frame=prev_end_frame,
+                    tr_name=tr_name if has_tr_in else "none",
+                    tr_dur=tr_dur if has_tr_in else 0.0,
                 )
                 return seg_out
 
@@ -1331,7 +1521,7 @@ def handler(job):
             vf_str = ",".join([p for p in vf_parts if p])
 
             run_cmd([
-                "ffmpeg", "-y",
+                "ffmpeg", "-y", "-loglevel", "error",
                 *input_args,
                 "-vf", vf_str,
                 *v_enc_args,
@@ -1341,7 +1531,7 @@ def handler(job):
             return seg_out
 
         rendered_by_idx = {}
-        with ThreadPoolExecutor(max_workers=4 if use_nvenc else 2) as rpool:
+        with ThreadPoolExecutor(max_workers=3 if use_nvenc else 2) as rpool:
             rfuts = {rpool.submit(render_single_clip, idx, clip): idx for idx, clip in enumerate(clips)}
             for fut in as_completed(rfuts):
                 c_idx = rfuts[fut]
@@ -1353,39 +1543,19 @@ def handler(job):
         if not segment_files:
             return {"error": "Nenhum segmento de vídeo pôde ser gerado."}
 
-        # 3. Concatenar segmentos visuais (com transições opcionais entre imagens)
-        seg_transitions: list[tuple[str, float]] = []
-        if authentic_intro_secs > 0.05:
-            seg_transitions.append(("none", 0.0))
-        for idx, clip in enumerate(clips):
-            tr_name = str(clip.get("transition") or "none").lower()
-            tr_dur = float(clip.get("transitionDuration") or 0.5)
-            # Primeiro clipe visual (sem clipe anterior real) não precisa de transição
-            if idx == 0 and authentic_intro_secs <= 0.05:
-                seg_transitions.append(("none", 0.0))
-            else:
-                seg_transitions.append((tr_name, tr_dur))
-
-        has_any_transition = any(t[0] not in ("", "none") and t[1] > 0.05 for t in seg_transitions)
+        # 3. Concatenar segmentos visuais (transições já aplicadas diretamente na Etapa 2 em paralelo -> concat -c copy instantâneo)
         visual_video_path = os.path.join(work_dir, "visual_concat.mp4")
+        concat_list_path = os.path.join(work_dir, "concat.txt")
+        with open(concat_list_path, "w", encoding="utf-8") as f:
+            for seg in segment_files:
+                f.write(f"file '{seg}'\n")
 
-        if has_any_transition and HAS_OPENCV:
-            print(f"[RunPod] Aplicando transições entre clipes ({sum(1 for t in seg_transitions if t[0] != 'none')} cortes)...")
-            concat_with_transitions_opencv(
-                segment_files, seg_transitions, visual_video_path, width, height, fps, v_enc_args
-            )
-        else:
-            concat_list_path = os.path.join(work_dir, "concat.txt")
-            with open(concat_list_path, "w", encoding="utf-8") as f:
-                for seg in segment_files:
-                    f.write(f"file '{seg}'\n")
-
-            run_cmd([
-                "ffmpeg", "-y",
-                "-f", "concat", "-safe", "0", "-i", concat_list_path,
-                "-c", "copy",
-                visual_video_path
-            ], "Concatenar segmentos visuais")
+        run_cmd([
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-f", "concat", "-safe", "0", "-i", concat_list_path,
+            "-c", "copy",
+            visual_video_path
+        ], "Concatenar segmentos visuais")
 
         # 3b. Aplicar overlays de personagem (PIP + Animação + Fundo + Efeito) se configurados
         character_overlays = inp.get("characterOverlays", [])
