@@ -18,7 +18,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     fonts-noto-core \
     curl \
     ca-certificates \
-    && (apt-get install -y --no-install-recommends fonts-roboto fonts-comic-neue || true) \
+    && (apt-get install -y --no-install-recommends fonts-roboto || true) \
+    && (apt-get install -y --no-install-recommends fonts-comic-neue || true) \
     && fc-cache -f -v \
     && rm -rf /var/lib/apt/lists/*
 

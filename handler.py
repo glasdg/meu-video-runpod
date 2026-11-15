@@ -1108,12 +1108,12 @@ def composite_characters_opencv(
                         borderMode=cv2.BORDER_CONSTANT,
                         borderValue=(0, 0, 0, 0),
                     )
-                    alpha_u16 = ((warped_char[:, :, 3:4].astype(np.uint16) * int(round(d_opacity * 256.0))) >> 8)
-                    inv_alpha_u16 = 255 - alpha_u16
-                    roi_u16 = frame[by0:by1, bx0:bx1].astype(np.uint16)
-                    char_u16 = warped_char[:, :, :3].astype(np.uint16)
-                    blended = ((roi_u16 * inv_alpha_u16 + char_u16 * alpha_u16) * 257) >> 16
-                    frame[by0:by1, bx0:bx1] = blended.astype(np.uint8)
+                    alpha_u32 = ((warped_char[:, :, 3:4].astype(np.uint32) * int(round(d_opacity * 256.0))) >> 8)
+                    inv_alpha_u32 = 255 - alpha_u32
+                    roi_u32 = frame[by0:by1, bx0:bx1].astype(np.uint32)
+                    char_u32 = warped_char[:, :, :3].astype(np.uint32)
+                    blended = ((roi_u32 * inv_alpha_u32 + char_u32 * alpha_u32) * 257 + 32768) >> 16
+                    frame[by0:by1, bx0:bx1] = np.clip(blended, 0, 255).astype(np.uint8)
 
             if use_pil_subs and pil_sub_windows:
                 for s_idx, (ss_t, se_t, s_txt) in enumerate(pil_sub_windows):
@@ -1649,7 +1649,10 @@ def _load_pil_font(role: str, size_px: int):
             return ImageFont.truetype(fp, sz)
         except Exception:
             pass
-    return ImageFont.load_default()
+    try:
+        return ImageFont.load_default(size=sz)
+    except Exception:
+        return ImageFont.load_default()
 
 
 def _render_pil_subtitle_overlay(
@@ -1678,14 +1681,15 @@ def _render_pil_subtitle_overlay(
     canvas_img = Image.new("RGBA", (width, height), (0, 0, 0, 0))
     draw = ImageDraw.Draw(canvas_img)
 
-    def _draw_shadow_layer(draw_fn, ox: float, oy: float, blur_r: float):
+    def _draw_shadow_layer(draw_fn, ox: float, oy: float, blur_r: float, base_rgb: tuple[int, int, int] = (0, 0, 0)):
+        bg_rgba = (base_rgb[0], base_rgb[1], base_rgb[2], 0)
         if blur_r <= 0.4:
-            sh = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+            sh = Image.new("RGBA", (width, height), bg_rgba)
             sd = ImageDraw.Draw(sh)
             draw_fn(sd, ox, oy)
             canvas_img.alpha_composite(sh)
             return
-        sh = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+        sh = Image.new("RGBA", (width, height), bg_rgba)
         sd = ImageDraw.Draw(sh)
         draw_fn(sd, ox, oy)
         sh = sh.filter(ImageFilter.GaussianBlur(radius=float(blur_r)))
@@ -1793,8 +1797,8 @@ def _render_pil_subtitle_overlay(
                 ly = y - (len(lines) - 1 - i) * line_h
                 sd.text((x + ox, (ly - descent) + oy), ln, font=font, fill=(0, 0, 0, 217), anchor="ms")
 
-        _draw_shadow_layer(_paint_neon_glow, 0.0, 0.0, glow_blur)
-        _draw_shadow_layer(_paint_neon_glow, 0.0, 0.0, max(2.0, glow_blur * 0.45))
+        _draw_shadow_layer(_paint_neon_glow, 0.0, 0.0, glow_blur, (6, 182, 212))
+        _draw_shadow_layer(_paint_neon_glow, 0.0, 0.0, max(2.0, glow_blur * 0.45), (6, 182, 212))
         _draw_shadow_layer(_paint_neon_drop, 2.0, 2.0, 1.5)
         for i, ln in enumerate(lines):
             ly = y - (len(lines) - 1 - i) * line_h
@@ -1907,18 +1911,18 @@ def _render_pil_subtitle_overlay(
         return None
 
     crop_rgba = np.array(canvas_img.crop((bx0, by0, bx1, by1)), dtype=np.uint8)
-    bgr_u16 = crop_rgba[:, :, :3][:, :, ::-1].astype(np.uint16)
-    alpha_u16 = crop_rgba[:, :, 3:4].astype(np.uint16)
-    inv_u16 = 255 - alpha_u16
+    bgr_u32 = crop_rgba[:, :, :3][:, :, ::-1].astype(np.uint32)
+    alpha_u32 = crop_rgba[:, :, 3:4].astype(np.uint32)
+    inv_u32 = 255 - alpha_u32
 
     out = {
         "bx0": bx0,
         "by0": by0,
         "bx1": bx1,
         "by1": by1,
-        "bgr_u16": bgr_u16,
-        "alpha_u16": alpha_u16,
-        "inv_u16": inv_u16,
+        "bgr_u32": bgr_u32,
+        "alpha_u32": alpha_u32,
+        "inv_u32": inv_u32,
         "rgba": crop_rgba,
         "karaoke": False,
     }
@@ -1926,9 +1930,9 @@ def _render_pil_subtitle_overlay(
     if is_karaoke and active_overlay_arr is not None:
         act_crop = active_overlay_arr[by0:by1, bx0:bx1]
         out["karaoke"] = True
-        out["act_bgr_u16"] = act_crop[:, :, :3][:, :, ::-1].astype(np.uint16)
-        out["act_alpha_u16"] = act_crop[:, :, 3:4].astype(np.uint16)
-        out["act_inv_u16"] = 255 - out["act_alpha_u16"]
+        out["act_bgr_u32"] = act_crop[:, :, :3][:, :, ::-1].astype(np.uint32)
+        out["act_alpha_u32"] = act_crop[:, :, 3:4].astype(np.uint32)
+        out["act_inv_u32"] = 255 - out["act_alpha_u32"]
         out["t_left"] = max(0, text_left_x - bx0)
         out["t_right"] = min(bx1 - bx0, text_right_x - bx0)
 
@@ -1964,22 +1968,22 @@ def _find_active_pil_overlay(overlays: list[tuple[float, float, dict]], cur_t: f
 
 def _stamp_pil_subtitle(frame: np.ndarray, ov: dict, cur_t: float, s_t: float, e_t: float) -> None:
     bx0, by0, bx1, by1 = ov["bx0"], ov["by0"], ov["bx1"], ov["by1"]
-    roi_u16 = frame[by0:by1, bx0:bx1].astype(np.uint16)
+    roi_u32 = frame[by0:by1, bx0:bx1].astype(np.uint32)
 
     if ov.get("karaoke"):
         prog = max(0.0, min(1.0, (cur_t - s_t) / max(0.1, e_t - s_t)))
         tl = ov["t_left"]
         tr = ov["t_right"]
         split_x = max(0, min(bx1 - bx0, int(round(tl + (tr - tl) * prog))))
-        out_roi = ((roi_u16 * ov["inv_u16"] + ov["bgr_u16"] * ov["alpha_u16"]) * 257) >> 16
+        out_roi = ((roi_u32 * ov["inv_u32"] + ov["bgr_u32"] * ov["alpha_u32"]) * 257 + 32768) >> 16
         if split_x > 0:
-            act_part = ((roi_u16[:, :split_x] * ov["act_inv_u16"][:, :split_x] + ov["act_bgr_u16"][:, :split_x] * ov["act_alpha_u16"][:, :split_x]) * 257) >> 16
+            act_part = ((roi_u32[:, :split_x] * ov["act_inv_u32"][:, :split_x] + ov["act_bgr_u32"][:, :split_x] * ov["act_alpha_u32"][:, :split_x]) * 257 + 32768) >> 16
             out_roi[:, :split_x] = act_part
-        frame[by0:by1, bx0:bx1] = out_roi.astype(np.uint8)
+        frame[by0:by1, bx0:bx1] = np.clip(out_roi, 0, 255).astype(np.uint8)
         return
 
-    blended = ((roi_u16 * ov["inv_u16"] + ov["bgr_u16"] * ov["alpha_u16"]) * 257) >> 16
-    frame[by0:by1, bx0:bx1] = blended.astype(np.uint8)
+    blended = ((roi_u32 * ov["inv_u32"] + ov["bgr_u32"] * ov["alpha_u32"]) * 257 + 32768) >> 16
+    frame[by0:by1, bx0:bx1] = np.clip(blended, 0, 255).astype(np.uint8)
 
 
 # ==============================================================================
