@@ -7,6 +7,7 @@ personagens, mixagem de áudio/música de fundo e queima as legendas estilizadas
 """
 
 import os
+import re
 import json
 import uuid
 import math
@@ -17,7 +18,8 @@ import base64
 import tempfile
 import threading
 import subprocess
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import multiprocessing
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 import requests
 import runpod
 
@@ -45,15 +47,24 @@ def has_nvenc() -> bool:
     try:
         out = subprocess.check_output(["ffmpeg", "-hide_banner", "-encoders"], text=True, stderr=subprocess.STDOUT)
         if "h264_nvenc" not in out:
+            print("[RunPod NVENC] h264_nvenc não listado em ffmpeg -encoders.")
             return False
-        # Teste rápido para confirmar que a GPU / driver NVIDIA está realmente acessível no container
+        # Usa 256x256 pois GPUs Ampere/Turing (RTX A5000, RTX 4090, L4) exigem largura mínima >= 145px no NVENC H.264
         test = subprocess.run(
-            ["ffmpeg", "-y", "-f", "lavfi", "-i", "color=c=black:s=128x128:d=0.1", "-c:v", "h264_nvenc", "-f", "null", "-"],
+            [
+                "ffmpeg", "-y", "-f", "lavfi", "-i", "color=c=black:s=256x256:d=0.1",
+                "-c:v", "h264_nvenc", "-preset", "p1", "-pix_fmt", "yuv420p", "-f", "null", "-"
+            ],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            text=True,
         )
-        return test.returncode == 0
-    except Exception:
+        if test.returncode != 0:
+            print(f"[RunPod NVENC] Teste 256x256 falhou (code {test.returncode}): {(test.stderr or '')[-500:]}")
+            return False
+        return True
+    except Exception as e:
+        print(f"[RunPod NVENC] Exceção ao testar NVENC: {e}")
         return False
 
 
@@ -199,45 +210,55 @@ def build_affine_matrix(
     ty: float,
     custom_transform: dict | None,
 ):
-    img_ratio = src_w / float(max(1, src_h))
+    sw = float(max(1, src_w))
+    sh = float(max(1, src_h))
+    img_ratio = sw / sh
     canvas_ratio = width / float(max(1, height))
     if img_ratio > canvas_ratio:
         draw_w = float(width)
-        draw_h = float(src_h) * (width / float(max(1, src_w)))
+        draw_h = sh * (width / sw)
     else:
         draw_h = float(height)
-        draw_w = float(src_w) * (height / float(max(1, src_h)))
+        draw_w = sw * (height / sh)
 
-    t_fit = np.array([
-        [draw_w / float(max(1, src_w)), 0.0, -draw_w / 2.0],
-        [0.0, draw_h / float(max(1, src_h)), -draw_h / 2.0],
-        [0.0, 0.0, 1.0],
-    ], dtype=np.float64)
+    f_sx = draw_w / sw
+    f_sy = draw_h / sh
+    f_tx = -draw_w * 0.5
+    f_ty = -draw_h * 0.5
 
-    t_kb = np.array([
-        [scale, 0.0, tx],
-        [0.0, scale, ty],
-        [0.0, 0.0, 1.0],
-    ], dtype=np.float64)
+    # Combina t_kb @ t_fit escalarmente (zero alocação extra de matrizes NumPy)
+    kb_m00 = scale * f_sx
+    kb_m02 = scale * f_tx + tx
+    kb_m11 = scale * f_sy
+    kb_m12 = scale * f_ty + ty
 
-    ct = custom_transform or {}
+    if not custom_transform:
+        cx0 = width * 0.5
+        cy0 = height * 0.5
+        return np.array([
+            [kb_m00, 0.0, kb_m02 + cx0],
+            [0.0, kb_m11, kb_m12 + cy0],
+        ], dtype=np.float64)
+
+    ct = custom_transform
     scale_ratio = width / 1280.0
-    cx = (width / 2.0) + float(ct.get("x", 0.0) or 0.0) * scale_ratio
-    cy = (height / 2.0) + float(ct.get("y", 0.0) or 0.0) * scale_ratio
+    cx = (width * 0.5) + float(ct.get("x", 0.0) or 0.0) * scale_ratio
+    cy = (height * 0.5) + float(ct.get("y", 0.0) or 0.0) * scale_ratio
     csx = float(ct.get("scaleX", 1.0) or 1.0)
     csy = float(ct.get("scaleY", 1.0) or 1.0)
     rot_rad = math.radians(float(ct.get("rotation", 0.0) or 0.0))
     cos_r = math.cos(rot_rad)
     sin_r = math.sin(rot_rad)
 
-    t_custom = np.array([
-        [csx * cos_r, -csy * sin_r, cx],
-        [csx * sin_r, csy * cos_r, cy],
-        [0.0, 0.0, 1.0],
-    ], dtype=np.float64)
+    a = csx * cos_r
+    b = -csy * sin_r
+    c = csx * sin_r
+    d = csy * cos_r
 
-    mat = t_custom @ t_kb @ t_fit
-    return mat[:2, :]
+    return np.array([
+        [a * kb_m00, b * kb_m11, a * kb_m02 + b * kb_m12 + cx],
+        [c * kb_m00, d * kb_m11, c * kb_m02 + d * kb_m12 + cy],
+    ], dtype=np.float64)
 
 
 def _start_ffmpeg_pipe(ff_cmd: list[str]) -> tuple[subprocess.Popen, list[bytes], threading.Thread]:
@@ -306,16 +327,24 @@ def _close_and_wait_ffmpeg(
 
 
 def _resize_oversized_src(img: np.ndarray, width: int, height: int) -> np.ndarray:
-    """Reduz imagens gigantes (ex. 4K+) para ~1.5x o canvas antes do loop frame a frame para acelerar warpAffine."""
+    """Reduz imagens/vídeos muito acima do tamanho de destino (~1.28x) para acelerar drasticamente warpAffine."""
     h, w = img.shape[:2]
-    max_w = int(width * 1.65)
-    max_h = int(height * 1.65)
+    max_w = int(width * 1.28)
+    max_h = int(height * 1.28)
     if w > max_w and h > max_h:
         ratio = max(max_w / float(w), max_h / float(h))
         nw = max(width, int(round(w * ratio)))
         nh = max(height, int(round(h * ratio)))
         return cv2.resize(img, (nw, nh), interpolation=cv2.INTER_AREA)
     return img
+
+
+def _write_raw_frame(proc_stdin, frame: np.ndarray, use_yuv420p: bool) -> None:
+    if use_yuv420p:
+        yuv = cv2.cvtColor(frame, cv2.COLOR_BGR2YUV_I420)
+        proc_stdin.write(memoryview(yuv))
+    else:
+        proc_stdin.write(memoryview(np.ascontiguousarray(frame)))
 
 
 def get_prev_clip_end_frame(
@@ -440,10 +469,11 @@ def render_clip_with_opencv(
                 pass
         return
 
+    use_yuv = (width % 2 == 0 and height % 2 == 0)
     ff_cmd = [
         "ffmpeg", "-y",
         "-f", "rawvideo",
-        "-pix_fmt", "bgr24",
+        "-pix_fmt", "yuv420p" if use_yuv else "bgr24",
         "-s", f"{width}x{height}",
         "-r", str(fps),
         "-i", "pipe:0",
@@ -471,7 +501,7 @@ def render_clip_with_opencv(
                     p = (f_idx + 1) / float(trans_frames + 1)
                     frame = blend_transition_frames(prev_end_frame, frame, tr_name, p, width, height)
                 try:
-                    proc.stdin.write(memoryview(np.ascontiguousarray(frame)))
+                    _write_raw_frame(proc.stdin, frame, use_yuv)
                 except BrokenPipeError:
                     break
         else:
@@ -484,7 +514,7 @@ def render_clip_with_opencv(
                 ok, frm = cap.read()
                 if not ok:
                     break
-                vid_frames.append(frm)
+                vid_frames.append(_resize_oversized_src(frm, width, height))
             cap.release()
             if not vid_frames:
                 raise RuntimeError(f"Vídeo sem frames legíveis: {src_path}")
@@ -501,7 +531,7 @@ def render_clip_with_opencv(
                     p = (f_idx + 1) / float(trans_frames + 1)
                     frame = blend_transition_frames(prev_end_frame, frame, tr_name, p, width, height)
                 try:
-                    proc.stdin.write(memoryview(np.ascontiguousarray(frame)))
+                    _write_raw_frame(proc.stdin, frame, use_yuv)
                 except BrokenPipeError:
                     break
     finally:
@@ -749,8 +779,9 @@ def composite_characters_opencv(
     height: int,
     fps: int,
     v_enc_args: list[str],
+    sub_filter: str | None = None,
 ):
-    """Composita fundo + efeito + personagem animado em sub-pixel sobre o vídeo."""
+    """Composita fundo + efeito + personagem animado em sub-pixel (+ legendas em 1 único passe) sobre o vídeo."""
     # Pré-carrega PNGs dos personagens com canal alpha e pré-renderiza camadas de fundo/efeito
     char_img_cache = {}
     bg_effect_cache = {}
@@ -766,6 +797,7 @@ def composite_characters_opencv(
             elif c_img.shape[2] == 3:
                 alpha_ch = np.full((c_img.shape[0], c_img.shape[1], 1), 255, dtype=np.uint8)
                 c_img = np.concatenate([c_img, alpha_ch], axis=2)
+            c_img = _resize_oversized_src(c_img, width, height)
             char_img_cache[c_path] = c_img
 
         bg_key = (
@@ -812,17 +844,22 @@ def composite_characters_opencv(
         raise RuntimeError(f"OpenCV não conseguiu abrir vídeo concatenado: {visual_video_path}")
 
     vid_fps = cap.get(cv2.CAP_PROP_FPS) or float(fps)
+    use_yuv = (width % 2 == 0 and height % 2 == 0)
     ff_cmd = [
         "ffmpeg", "-y",
         "-f", "rawvideo",
-        "-pix_fmt", "bgr24",
+        "-pix_fmt", "yuv420p" if use_yuv else "bgr24",
         "-s", f"{width}x{height}",
         "-r", f"{vid_fps:.3f}",
         "-i", "pipe:0",
+    ]
+    if sub_filter:
+        ff_cmd.extend(["-vf", sub_filter])
+    ff_cmd.extend([
         *v_enc_args,
         "-an",
         char_out_path,
-    ]
+    ])
     proc, stderr_chunks, stderr_thread = _start_ffmpeg_pipe(ff_cmd)
 
     scale_ratio = width / 1280.0
@@ -940,13 +977,15 @@ def composite_characters_opencv(
                         borderMode=cv2.BORDER_CONSTANT,
                         borderValue=(0, 0, 0, 0),
                     )
-                    alpha_f = (warped_char[:, :, 3:4].astype(np.float32) / 255.0) * d_opacity
-                    roi_frame = frame[by0:by1, bx0:bx1].astype(np.float32)
-                    blended = roi_frame * (1.0 - alpha_f) + warped_char[:, :, :3].astype(np.float32) * alpha_f
-                    frame[by0:by1, bx0:bx1] = np.clip(blended, 0, 255).astype(np.uint8)
+                    alpha_u16 = ((warped_char[:, :, 3:4].astype(np.uint16) * int(round(d_opacity * 256.0))) >> 8)
+                    inv_alpha_u16 = 255 - alpha_u16
+                    roi_u16 = frame[by0:by1, bx0:bx1].astype(np.uint16)
+                    char_u16 = warped_char[:, :, :3].astype(np.uint16)
+                    blended = ((roi_u16 * inv_alpha_u16 + char_u16 * alpha_u16) * 257) >> 16
+                    frame[by0:by1, bx0:bx1] = blended.astype(np.uint8)
 
             try:
-                proc.stdin.write(memoryview(np.ascontiguousarray(frame)))
+                _write_raw_frame(proc.stdin, frame, use_yuv)
             except BrokenPipeError:
                 break
     finally:
@@ -1349,6 +1388,177 @@ def upload_to_temp_cloud(file_path: str, job_id: str = "job") -> tuple[str | Non
 
 
 # ==============================================================================
+# PARSING DE LEGENDAS & WORKER MULTIPROCESSADO DE CLIPES
+# ==============================================================================
+
+def _parse_ass_or_srt_time(ts: str) -> float:
+    parts = ts.strip().replace(",", ".").split(":")
+    if len(parts) != 3:
+        return 0.0
+    try:
+        return float(parts[0]) * 3600.0 + float(parts[1]) * 60.0 + float(parts[2])
+    except Exception:
+        return 0.0
+
+
+def _parse_subtitle_intervals(sub_file_path: str | None) -> list[tuple[float, float]]:
+    if not sub_file_path or not os.path.exists(sub_file_path):
+        return []
+    intervals: list[tuple[float, float]] = []
+    try:
+        with open(sub_file_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        if sub_file_path.endswith(".ass"):
+            for line in content.splitlines():
+                if line.startswith("Dialogue:"):
+                    cols = line.split(",", 9)
+                    if len(cols) >= 3:
+                        s_t = _parse_ass_or_srt_time(cols[1])
+                        e_t = _parse_ass_or_srt_time(cols[2])
+                        if e_t > s_t:
+                            intervals.append((s_t, e_t))
+        else:
+            for m in re.finditer(r"(\d{1,2}:\d{2}:\d{2}[,.]\d{1,3})\s*-->\s*(\d{1,2}:\d{2}:\d{2}[,.]\d{1,3})", content):
+                s_t = _parse_ass_or_srt_time(m.group(1))
+                e_t = _parse_ass_or_srt_time(m.group(2))
+                if e_t > s_t:
+                    intervals.append((s_t, e_t))
+    except Exception as e:
+        print(f"[RunPod Warning] Falha ao analisar intervalos de legenda: {e}")
+    return intervals
+
+
+def _clip_has_subtitles(clip_start: float, clip_end: float, intervals: list[tuple[float, float]]) -> bool:
+    for s_t, e_t in intervals:
+        if e_t > clip_start and s_t < clip_end:
+            return True
+    return False
+
+
+def _render_clip_worker(task_args: tuple) -> tuple[int, str]:
+    (
+        idx,
+        clip,
+        clips,
+        clip_paths,
+        work_dir,
+        width,
+        height,
+        fps,
+        v_enc_args,
+        authentic_intro_secs,
+        clip_timeline_start,
+        sub_filter,
+        clip_needs_sub,
+    ) = task_args
+
+    if HAS_OPENCV:
+        try:
+            cv2.setNumThreads(1)
+        except Exception:
+            pass
+
+    dur = max(0.2, float(clip.get("duration", 3.0)))
+    seg_out = os.path.join(work_dir, f"seg_{idx+1:04d}.mp4")
+    src_path = clip_paths.get(idx)
+
+    sub_vf = None
+    if sub_filter and clip_needs_sub:
+        sub_vf = f"setpts=PTS+{clip_timeline_start:.3f}/TB,{sub_filter},setpts=PTS-STARTPTS"
+
+    if not src_path or not os.path.exists(src_path):
+        cmd = [
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-f", "lavfi", "-i", f"color=c=black:s={width}x{height}:r={fps}:d={dur:.3f}",
+        ]
+        if sub_vf:
+            cmd.extend(["-vf", sub_vf])
+        cmd.extend([*v_enc_args, "-an", seg_out])
+        run_cmd(cmd, f"Clipe {idx+1} (tela preta)")
+        return idx, seg_out
+
+    vf_post_parts = []
+    vis_filter = get_visual_filter_expr(clip.get("visualFilter", "none"))
+    if vis_filter:
+        vf_post_parts.append(vis_filter)
+
+    ov_filter = get_overlay_filter_expr(clip.get("overlayEffect", "none"), width, height)
+    if ov_filter:
+        vf_post_parts.append(ov_filter)
+
+    if sub_vf:
+        vf_post_parts.append(sub_vf)
+
+    movement = clip.get("movement", "none")
+    camera_effect = clip.get("cameraEffect", "none")
+    custom_transform = clip.get("customTransform")
+    needs_motion = (
+        (movement and movement != "none")
+        or (camera_effect and camera_effect != "none")
+        or bool(custom_transform)
+    )
+
+    tr_name = str(clip.get("transition") or "none").lower()
+    tr_dur = float(clip.get("transitionDuration") or 0.5)
+    has_tr_in = (idx > 0 or authentic_intro_secs > 0.05) and tr_name not in ("", "none") and tr_dur > 0.05
+
+    if HAS_OPENCV and (clip.get("type") != "video" or needs_motion or has_tr_in):
+        prev_end_frame = (
+            get_prev_clip_end_frame(idx, clips, clip_paths, width, height, authentic_intro_secs)
+            if has_tr_in
+            else None
+        )
+        render_clip_with_opencv(
+            idx,
+            clip,
+            src_path,
+            seg_out,
+            width,
+            height,
+            fps,
+            dur,
+            vf_post_parts,
+            v_enc_args,
+            prev_end_frame=prev_end_frame,
+            tr_name=tr_name if has_tr_in else "none",
+            tr_dur=tr_dur if has_tr_in else 0.0,
+        )
+        return idx, seg_out
+
+    vf_parts = []
+    if clip.get("type") == "video":
+        speed = float(clip.get("playbackSpeed", 1.0) or 1.0)
+        if abs(speed - 1.0) > 0.05:
+            vf_parts.append(f"setpts={1.0/speed:.4f}*PTS")
+        vf_parts.append(f"scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},setsar=1,fps={fps}")
+        input_args = ["-stream_loop", "-1", "-i", src_path, "-t", f"{dur:.3f}"]
+    else:
+        kb = build_ken_burns_filter(movement, dur, fps, width, height)
+        vf_parts.append(kb)
+        input_args = ["-loop", "1", "-i", src_path, "-t", f"{dur:.3f}"]
+
+    vf_parts.extend(vf_post_parts)
+    vf_str = ",".join([p for p in vf_parts if p])
+
+    run_cmd([
+        "ffmpeg", "-y", "-loglevel", "error",
+        *input_args,
+        "-vf", vf_str,
+        *v_enc_args,
+        "-an",
+        seg_out
+    ], f"Renderizar clipe {idx+1}/{len(clips)}")
+    return idx, seg_out
+
+
+def _report_progress(job: dict, progress_pct: int, stage: str) -> None:
+    try:
+        runpod.serverless.progress_update(job, {"progress": int(progress_pct), "stage": stage})
+    except Exception:
+        pass
+
+
+# ==============================================================================
 # HANDLER PRINCIPAL RUNPOD
 # ==============================================================================
 
@@ -1370,6 +1580,7 @@ def handler(job):
         clips = inp.get("clips", [])
         audio_tracks = inp.get("audioTracks", [])
         background_music = inp.get("backgroundMusic")
+        character_overlays = inp.get("characterOverlays", [])
         subtitles_ass = inp.get("subtitlesAss", "")
         subtitles_srt = inp.get("subtitlesSrt", "")
         callback_upload_url = inp.get("callbackUploadUrl", "")
@@ -1381,18 +1592,21 @@ def handler(job):
         use_nvenc = has_nvenc()
         vcodec = "h264_nvenc" if use_nvenc else "libx264"
         if use_nvenc:
-            preset_flag = "p6" if preset_mode == "high" else ("p1" if preset_mode == "fast" else "p4")
-            cq_val = "19" if preset_mode == "high" else ("25" if preset_mode == "fast" else "21")
-            v_enc_args = ["-c:v", "h264_nvenc", "-preset", preset_flag, "-cq", cq_val, "-pix_fmt", "yuv420p"]
+            if preset_mode == "high":
+                v_enc_args = ["-c:v", "h264_nvenc", "-preset", "p5", "-cq", "19", "-pix_fmt", "yuv420p"]
+            elif preset_mode == "fast":
+                v_enc_args = ["-c:v", "h264_nvenc", "-preset", "p1", "-tune", "ull", "-rc", "constqp", "-qp", "25", "-bf", "0", "-pix_fmt", "yuv420p"]
+            else:
+                v_enc_args = ["-c:v", "h264_nvenc", "-preset", "p3", "-cq", "21", "-bf", "0", "-pix_fmt", "yuv420p"]
         else:
             preset_flag = "slow" if preset_mode == "high" else ("ultrafast" if preset_mode == "fast" else "medium")
             crf_val = "18" if preset_mode == "high" else ("26" if preset_mode == "fast" else "21")
             v_enc_args = ["-c:v", "libx264", "-preset", preset_flag, "-crf", crf_val, "-pix_fmt", "yuv420p"]
 
-        print(f"[RunPod] Encoder selecionado: {vcodec} | {width}x{height} @ {fps}fps | {len(clips)} clipes | {len(audio_tracks)} áudios")
+        print(f"[RunPod] Encoder selecionado: {vcodec} ({preset_mode}) | {width}x{height} @ {fps}fps | {len(clips)} clipes | {len(audio_tracks)} áudios | CPUs: {os.cpu_count()}")
+        _report_progress(job, 55, f"Baixando {len(clips)} mídias e {len(audio_tracks)} áudios...")
 
         # 1. Baixar todas as mídias e áudios em paralelo
-        download_tasks = []
         media_dir = os.path.join(work_dir, "media")
         os.makedirs(media_dir, exist_ok=True)
 
@@ -1400,7 +1614,7 @@ def handler(job):
         audio_paths = {}
         bgm_path = None
 
-        with ThreadPoolExecutor(max_workers=8) as pool:
+        with ThreadPoolExecutor(max_workers=10) as pool:
             futures = {}
             for idx, clip in enumerate(clips):
                 url = clip.get("url", "")
@@ -1434,108 +1648,102 @@ def handler(job):
                 except Exception as dl_err:
                     print(f"[RunPod Warning] Falha ao baixar {kind} #{idx}: {dl_err}")
 
-        # 2. Renderizar cada clipe individualmente (com Ken Burns, Filtro, Overlay, Duração exata)
-        segment_files = []
+        # Preparar arquivo de legendas antecipadamente para fundir na Etapa 2 ou 3b (elimina re-encode completo na Etapa 4!)
+        sub_file_path = None
+        sub_filter = None
+        sub_intervals: list[tuple[float, float]] = []
+        if subtitles_ass and subtitles_ass.strip():
+            sub_file_path = os.path.join(work_dir, "subtitles.ass")
+            with open(sub_file_path, "w", encoding="utf-8") as f:
+                f.write(subtitles_ass)
+        elif subtitles_srt and subtitles_srt.strip():
+            sub_file_path = os.path.join(work_dir, "subtitles.srt")
+            with open(sub_file_path, "w", encoding="utf-8") as f:
+                f.write(subtitles_srt)
 
-        # Se houver introdução autêntica (tela preta inicial para vídeos externos)
-        if authentic_intro_secs > 0.05:
+        if sub_file_path:
+            escaped_sub = sub_file_path.replace("\\", "/").replace(":", "\\:")
+            sub_filter = f"ass={escaped_sub}" if sub_file_path.endswith(".ass") else f"subtitles={escaped_sub}"
+            sub_intervals = _parse_subtitle_intervals(sub_file_path)
+
+        has_char_overlays = bool(character_overlays)
+        burn_subs_in_clips = bool(sub_filter and not has_char_overlays)
+
+        # 2. Renderizar cada clipe individualmente em multiprocesso (sem GIL!)
+        segment_files = []
+        intro_dur = authentic_intro_secs if authentic_intro_secs > 0.05 else 0.0
+
+        if intro_dur > 0:
             black_seg = os.path.join(work_dir, "seg_0000_black.mp4")
-            run_cmd([
-                "ffmpeg", "-y",
-                "-f", "lavfi", "-i", f"color=c=black:s={width}x{height}:r={fps}:d={authentic_intro_secs:.3f}",
-                *v_enc_args, "-an", black_seg
-            ], "Gerar tela preta inicial")
+            intro_cmd = [
+                "ffmpeg", "-y", "-loglevel", "error",
+                "-f", "lavfi", "-i", f"color=c=black:s={width}x{height}:r={fps}:d={intro_dur:.3f}",
+            ]
+            if burn_subs_in_clips and _clip_has_subtitles(0.0, intro_dur, sub_intervals):
+                intro_cmd.extend(["-vf", sub_filter])
+            intro_cmd.extend([*v_enc_args, "-an", black_seg])
+            run_cmd(intro_cmd, "Gerar tela preta inicial")
             segment_files.append(black_seg)
 
-        def render_single_clip(idx: int, clip: dict) -> str:
+        clip_tasks = []
+        t_cursor = intro_dur
+        for idx, clip in enumerate(clips):
             dur = max(0.2, float(clip.get("duration", 3.0)))
-            seg_out = os.path.join(work_dir, f"seg_{idx+1:04d}.mp4")
-            src_path = clip_paths.get(idx)
+            clip_end = t_cursor + dur
+            needs_sub = burn_subs_in_clips and _clip_has_subtitles(t_cursor, clip_end, sub_intervals)
+            clip_tasks.append((
+                idx,
+                clip,
+                clips,
+                clip_paths,
+                work_dir,
+                width,
+                height,
+                fps,
+                v_enc_args,
+                authentic_intro_secs,
+                t_cursor,
+                sub_filter if burn_subs_in_clips else None,
+                needs_sub,
+            ))
+            t_cursor = clip_end
 
-            if not src_path or not os.path.exists(src_path):
-                run_cmd([
-                    "ffmpeg", "-y", "-loglevel", "error",
-                    "-f", "lavfi", "-i", f"color=c=black:s={width}x{height}:r={fps}:d={dur:.3f}",
-                    *v_enc_args, "-an", seg_out
-                ], f"Clipe {idx+1} (tela preta)")
-                return seg_out
-
-            vf_post_parts = []
-            vis_filter = get_visual_filter_expr(clip.get("visualFilter", "none"))
-            if vis_filter:
-                vf_post_parts.append(vis_filter)
-
-            ov_filter = get_overlay_filter_expr(clip.get("overlayEffect", "none"), width, height)
-            if ov_filter:
-                vf_post_parts.append(ov_filter)
-
-            movement = clip.get("movement", "none")
-            camera_effect = clip.get("cameraEffect", "none")
-            custom_transform = clip.get("customTransform")
-            needs_motion = (
-                (movement and movement != "none")
-                or (camera_effect and camera_effect != "none")
-                or bool(custom_transform)
-            )
-
-            tr_name = str(clip.get("transition") or "none").lower()
-            tr_dur = float(clip.get("transitionDuration") or 0.5)
-            has_tr_in = (idx > 0 or authentic_intro_secs > 0.05) and tr_name not in ("", "none") and tr_dur > 0.05
-
-            if HAS_OPENCV and (clip.get("type") != "video" or needs_motion or has_tr_in):
-                prev_end_frame = (
-                    get_prev_clip_end_frame(idx, clips, clip_paths, width, height, authentic_intro_secs)
-                    if has_tr_in
-                    else None
-                )
-                render_clip_with_opencv(
-                    idx,
-                    clip,
-                    src_path,
-                    seg_out,
-                    width,
-                    height,
-                    fps,
-                    dur,
-                    vf_post_parts,
-                    v_enc_args,
-                    prev_end_frame=prev_end_frame,
-                    tr_name=tr_name if has_tr_in else "none",
-                    tr_dur=tr_dur if has_tr_in else 0.0,
-                )
-                return seg_out
-
-            vf_parts = []
-            if clip.get("type") == "video":
-                speed = float(clip.get("playbackSpeed", 1.0) or 1.0)
-                if abs(speed - 1.0) > 0.05:
-                    vf_parts.append(f"setpts={1.0/speed:.4f}*PTS")
-                vf_parts.append(f"scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},setsar=1,fps={fps}")
-                input_args = ["-stream_loop", "-1", "-i", src_path, "-t", f"{dur:.3f}"]
-            else:
-                kb = build_ken_burns_filter(movement, dur, fps, width, height)
-                vf_parts.append(kb)
-                input_args = ["-loop", "1", "-i", src_path, "-t", f"{dur:.3f}"]
-
-            vf_parts.extend(vf_post_parts)
-            vf_str = ",".join([p for p in vf_parts if p])
-
-            run_cmd([
-                "ffmpeg", "-y", "-loglevel", "error",
-                *input_args,
-                "-vf", vf_str,
-                *v_enc_args,
-                "-an",
-                seg_out
-            ], f"Renderizar clipe {idx+1}/{len(clips)}")
-            return seg_out
+        cpu_cnt = os.cpu_count() or 4
+        clip_workers = min(8, max(3, cpu_cnt)) if use_nvenc else min(4, max(2, cpu_cnt // 2))
+        print(f"[RunPod] Renderizando {len(clips)} clipes com {clip_workers} processos paralelos (legendas no passe dos clipes: {burn_subs_in_clips})")
 
         rendered_by_idx = {}
-        with ThreadPoolExecutor(max_workers=3 if use_nvenc else 2) as rpool:
-            rfuts = {rpool.submit(render_single_clip, idx, clip): idx for idx, clip in enumerate(clips)}
-            for fut in as_completed(rfuts):
-                c_idx = rfuts[fut]
-                rendered_by_idx[c_idx] = fut.result()
+        done_count = 0
+        last_prog_ts = 0.0
+        total_clips = max(1, len(clip_tasks))
+
+        def _track_clip_done(c_idx: int, res_path: str):
+            nonlocal done_count, last_prog_ts
+            rendered_by_idx[c_idx] = res_path
+            done_count += 1
+            now_t = time.time()
+            if now_t - last_prog_ts >= 4.0 or done_count == total_clips:
+                last_prog_ts = now_t
+                pct = 58 + int((done_count / float(total_clips)) * 30)
+                _report_progress(job, pct, f"Renderizando clipes na GPU ({done_count}/{total_clips})...")
+
+        if clip_tasks:
+            try:
+                mp_ctx = multiprocessing.get_context("spawn")
+                with ProcessPoolExecutor(max_workers=clip_workers, mp_context=mp_ctx) as rpool:
+                    rfuts = {rpool.submit(_render_clip_worker, t): t[0] for t in clip_tasks}
+                    for fut in as_completed(rfuts):
+                        c_idx, res_path = fut.result()
+                        _track_clip_done(c_idx, res_path)
+            except Exception as mp_err:
+                print(f"[RunPod Warning] ProcessPool fallback para ThreadPool: {mp_err}")
+                rendered_by_idx.clear()
+                done_count = 0
+                with ThreadPoolExecutor(max_workers=min(4, clip_workers)) as tpool:
+                    rfuts = {tpool.submit(_render_clip_worker, t): t[0] for t in clip_tasks}
+                    for fut in as_completed(rfuts):
+                        c_idx, res_path = fut.result()
+                        _track_clip_done(c_idx, res_path)
 
         for idx in range(len(clips)):
             segment_files.append(rendered_by_idx[idx])
@@ -1543,7 +1751,8 @@ def handler(job):
         if not segment_files:
             return {"error": "Nenhum segmento de vídeo pôde ser gerado."}
 
-        # 3. Concatenar segmentos visuais (transições já aplicadas diretamente na Etapa 2 em paralelo -> concat -c copy instantâneo)
+        # 3. Concatenar segmentos visuais (concat -c copy instantâneo)
+        _report_progress(job, 90, "Unindo segmentos do vídeo...")
         visual_video_path = os.path.join(work_dir, "visual_concat.mp4")
         concat_list_path = os.path.join(work_dir, "concat.txt")
         with open(concat_list_path, "w", encoding="utf-8") as f:
@@ -1557,9 +1766,10 @@ def handler(job):
             visual_video_path
         ], "Concatenar segmentos visuais")
 
-        # 3b. Aplicar overlays de personagem (PIP + Animação + Fundo + Efeito) se configurados
-        character_overlays = inp.get("characterOverlays", [])
+        # 3b. Aplicar overlays de personagem (e legendas no mesmo passe se houver personagens)
+        subs_already_burned = burn_subs_in_clips
         if character_overlays:
+            _report_progress(job, 92, "Aplicando personagens e legendas na GPU...")
             char_files = {}
             bg_img_cache = {}
             url_to_local = {}
@@ -1593,7 +1803,6 @@ def handler(job):
                         if kind == "charbg":
                             bg_img_cache.pop(src_url, None)
 
-            # Preenche entradas repetidas que compartilharam o mesmo URL
             for c_idx, ch in enumerate(character_overlays):
                 c_url = ch.get("url", "")
                 if c_idx not in char_files and c_url in url_to_local and os.path.exists(url_to_local[c_url]):
@@ -1604,8 +1813,18 @@ def handler(job):
                 char_out_path = os.path.join(work_dir, "visual_with_chars.mp4")
                 if HAS_OPENCV:
                     composite_characters_opencv(
-                        visual_video_path, char_out_path, valid_chars, bg_img_cache, width, height, fps, v_enc_args
+                        visual_video_path,
+                        char_out_path,
+                        valid_chars,
+                        bg_img_cache,
+                        width,
+                        height,
+                        fps,
+                        v_enc_args,
+                        sub_filter=sub_filter,
                     )
+                    if sub_filter:
+                        subs_already_burned = True
                 else:
                     c_cmd = ["ffmpeg", "-y", "-i", visual_video_path]
                     fc_parts = []
@@ -1633,10 +1852,15 @@ def handler(job):
                             y_expr = base_y
 
                         scaled_lbl = f"[ch{n_idx}]"
-                        out_lbl = "[vchars]" if n_idx == len(valid_chars) else f"[vc{n_idx}]"
+                        out_lbl = "[vchars_raw]" if (n_idx == len(valid_chars) and sub_filter) else ("[vchars]" if n_idx == len(valid_chars) else f"[vc{n_idx}]")
                         fc_parts.append(f"[{n_idx}:v]scale=-1:{target_h}{scaled_lbl}")
                         fc_parts.append(f"{last_v}{scaled_lbl}overlay=x={x_expr}:y={y_expr}:enable='between(t,{c_start:.2f},{c_end:.2f})'{out_lbl}")
                         last_v = out_lbl
+
+                    if sub_filter:
+                        fc_parts.append(f"{last_v}{sub_filter}[vchars]")
+                        last_v = "[vchars]"
+                        subs_already_burned = True
 
                     c_cmd.extend([
                         "-filter_complex", ";".join(fc_parts),
@@ -1645,25 +1869,14 @@ def handler(job):
                         "-an",
                         char_out_path
                     ])
-                    run_cmd(c_cmd, "Aplicar personagens PIP")
+                    run_cmd(c_cmd, "Aplicar personagens PIP e legendas")
                 visual_video_path = char_out_path
 
-        # 4. Queimar legendas (.ASS prioritário, fallback .SRT) se fornecidas
+        # 4. Fallback de legendas apenas caso existam legendas e não tenham sido queimadas nas etapas anteriores
         subtitled_video_path = visual_video_path
-        sub_file_path = None
-        if subtitles_ass and subtitles_ass.strip():
-            sub_file_path = os.path.join(work_dir, "subtitles.ass")
-            with open(sub_file_path, "w", encoding="utf-8") as f:
-                f.write(subtitles_ass)
-        elif subtitles_srt and subtitles_srt.strip():
-            sub_file_path = os.path.join(work_dir, "subtitles.srt")
-            with open(sub_file_path, "w", encoding="utf-8") as f:
-                f.write(subtitles_srt)
-
-        if sub_file_path:
+        if sub_filter and not subs_already_burned:
+            _report_progress(job, 94, "Queimando legendas no vídeo...")
             subtitled_video_path = os.path.join(work_dir, "visual_subtitled.mp4")
-            escaped_sub = sub_file_path.replace("\\", "/").replace(":", "\\:")
-            sub_filter = f"ass={escaped_sub}" if sub_file_path.endswith(".ass") else f"subtitles={escaped_sub}"
             run_cmd([
                 "ffmpeg", "-y",
                 "-i", visual_video_path,
@@ -1672,6 +1885,8 @@ def handler(job):
                 "-an",
                 subtitled_video_path
             ], "Queimar legendas no vídeo")
+
+        _report_progress(job, 96, "Mixando áudios e finalizando MP4...")
 
         # 5. Mixar todas as trilhas de áudio (narrações + música de fundo) e unir ao vídeo final
         final_output_path = os.path.join(work_dir, f"final_runpod_{job_id}.mp4")
