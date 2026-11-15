@@ -6,7 +6,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
 ENV NVIDIA_DRIVER_CAPABILITIES=compute,video,utility
 
-# 1. Instalar FFmpeg (com libass para legendas estilizadas .ASS/.SRT), Python, fontes e utilitários
+# 1. Instalar FFmpeg (com libass), Python, fontes compatíveis (Roboto, Liberation/Arial, DejaVu, Noto, Comic) e utilitários
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
     python3-pip \
@@ -18,6 +18,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     fonts-noto-core \
     curl \
     ca-certificates \
+    && (apt-get install -y --no-install-recommends fonts-roboto fonts-comic-neue || true) \
     && fc-cache -f -v \
     && rm -rf /var/lib/apt/lists/*
 

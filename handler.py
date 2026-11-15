@@ -30,6 +30,12 @@ try:
 except Exception:
     HAS_OPENCV = False
 
+try:
+    from PIL import Image, ImageDraw, ImageFont, ImageFilter
+    HAS_PIL = True
+except Exception:
+    HAS_PIL = False
+
 # ==============================================================================
 # UTILITÁRIOS
 # ==============================================================================
@@ -421,8 +427,12 @@ def render_clip_with_opencv(
     prev_end_frame: np.ndarray | None = None,
     tr_name: str = "none",
     tr_dur: float = 0.0,
+    pil_subs: list[dict] | None = None,
+    sub_config: dict | None = None,
+    clip_timeline_start: float = 0.0,
+    work_dir: str | None = None,
 ) -> None:
-    """Renderiza clipe usando OpenCV warpAffine sub-pixel (zero tremor) + transição de corte opcional + FFmpeg NVENC/x264."""
+    """Renderiza clipe usando OpenCV warpAffine sub-pixel + transição opcional + legendas Pillow idênticas ao Canvas + FFmpeg NVENC/x264."""
     is_video = clip.get("type") == "video"
     movement = clip.get("movement", "none")
     camera_effect = clip.get("cameraEffect", "none")
@@ -440,102 +450,211 @@ def render_clip_with_opencv(
         or (camera_effect and camera_effect != "none")
     )
 
-    # Atalho ultra-rápido: imagem estática sem transição e sem movimento não precisa enviar centenas de frames pelo pipe
-    if not is_video and not has_motion and trans_frames == 0:
-        img = cv2.imread(src_path, cv2.IMREAD_COLOR)
-        if img is None:
-            raise RuntimeError(f"OpenCV não conseguiu abrir imagem: {src_path}")
-        img = _resize_oversized_src(img, width, height)
-        src_h, src_w = img.shape[:2]
-        mat = build_affine_matrix(src_w, src_h, width, height, 1.0, 0.0, 0.0, custom_transform)
-        static_frame = cv2.warpAffine(img, mat, (width, height), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0))
-        static_png = f"{seg_out}.static.png"
-        cv2.imwrite(static_png, static_frame)
-        try:
-            cmd = [
-                "ffmpeg", "-y", "-loglevel", "error",
-                "-loop", "1", "-framerate", str(fps), "-i", static_png,
-                "-t", f"{dur:.3f}",
-            ]
-            if vf_post_parts:
-                cmd.extend(["-vf", ",".join(vf_post_parts)])
-            cmd.extend([*v_enc_args, "-an", seg_out])
-            run_cmd(cmd, f"Renderizar clipe estático {idx+1}")
-        finally:
-            try:
-                if os.path.exists(static_png):
-                    os.remove(static_png)
-            except Exception:
-                pass
-        return
+    use_pil_subs = bool(HAS_PIL and pil_subs)
+    pil_overlay_cache: list[tuple[float, float, dict]] = []
+    temp_sub_pngs: list[str] = []
 
-    use_yuv = (width % 2 == 0 and height % 2 == 0)
-    ff_cmd = [
-        "ffmpeg", "-y",
-        "-f", "rawvideo",
-        "-pix_fmt", "yuv420p" if use_yuv else "bgr24",
-        "-s", f"{width}x{height}",
-        "-r", str(fps),
-        "-i", "pipe:0",
-    ]
-    if vf_post_parts:
-        ff_cmd.extend(["-vf", ",".join(vf_post_parts)])
-    ff_cmd.extend([*v_enc_args, "-an", seg_out])
+    if use_pil_subs:
+        pil_overlay_cache = _prepare_clip_pil_overlays(pil_subs, sub_config or {}, width, height)
 
-    proc, stderr_chunks, stderr_thread = _start_ffmpeg_pipe(ff_cmd)
-    rng = random.Random(10007 * (idx + 1))
+    # Caso haja filtros pós-OpenCV (cinematic, noir, vignette etc.) + legendas Pillow,
+    # salva as legendas em PNGs recortados e aplica via FFmpeg overlay DEPOIS do filtro para manter as cores originais da legenda.
+    use_ffmpeg_png_subs = bool(use_pil_subs and vf_post_parts and pil_overlay_cache and work_dir)
+    stamp_pil_in_opencv = bool(use_pil_subs and pil_overlay_cache and not vf_post_parts)
+
+    def _build_filtered_png_ffmpeg_args(base_input_args: list[str], extra_vf: list[str]) -> list[str]:
+        cmd = ["ffmpeg", "-y", "-loglevel", "error", *base_input_args]
+        active_chunks: list[tuple[int, float, float, dict]] = []
+        for k_i, (s_t, e_t, ov) in enumerate(pil_overlay_cache):
+            rel_s = max(0.0, s_t - clip_timeline_start)
+            rel_e = min(dur, e_t - clip_timeline_start)
+            if rel_e > rel_s:
+                active_chunks.append((k_i, rel_s, rel_e, ov))
+
+        fc = []
+        last_v = "[0:v]"
+        if extra_vf:
+            fc.append(f"[0:v]{','.join(extra_vf)}[vbase]")
+            last_v = "[vbase]"
+        in_idx = 1
+        for c_pos, (k_i, rel_s, rel_e, ov) in enumerate(active_chunks):
+            png_path = os.path.join(work_dir, f"seg_{idx+1:04d}_sub_{k_i}.png")
+            _save_overlay_png(ov, png_path)
+            temp_sub_pngs.append(png_path)
+            cmd.extend(["-i", png_path])
+            out_lbl = "[vout]" if c_pos == len(active_chunks) - 1 else f"[vs{c_pos}]"
+            fc.append(
+                f"{last_v}[{in_idx}:v]overlay=x={ov['bx0']}:y={ov['by0']}:enable='between(t,{rel_s:.3f},{rel_e:.3f})'{out_lbl}"
+            )
+            last_v = out_lbl
+            in_idx += 1
+        if in_idx > 1:
+            cmd.extend(["-filter_complex", ";".join(fc), "-map", last_v])
+        elif extra_vf:
+            cmd.extend(["-vf", ",".join(extra_vf)])
+        cmd.extend([*v_enc_args, "-an", seg_out])
+        return cmd
 
     try:
-        if not is_video:
+        # Atalho ultra-rápido para imagem estática sem movimento nem transição:
+        if not is_video and not has_motion and trans_frames == 0:
             img = cv2.imread(src_path, cv2.IMREAD_COLOR)
             if img is None:
                 raise RuntimeError(f"OpenCV não conseguiu abrir imagem: {src_path}")
             img = _resize_oversized_src(img, width, height)
             src_h, src_w = img.shape[:2]
-            for f_idx in range(total_frames):
-                progress = f_idx / float(max(1, total_frames - 1))
-                scale, tx, ty = compute_capcut_transform(movement, camera_effect, progress, width, height, dur, rng)
-                mat = build_affine_matrix(src_w, src_h, width, height, scale, tx, ty, custom_transform)
-                frame = cv2.warpAffine(img, mat, (width, height), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0))
-                if trans_frames > 0 and f_idx < trans_frames:
-                    p = (f_idx + 1) / float(trans_frames + 1)
-                    frame = blend_transition_frames(prev_end_frame, frame, tr_name, p, width, height)
+            mat = build_affine_matrix(src_w, src_h, width, height, 1.0, 0.0, 0.0, custom_transform)
+            static_frame = cv2.warpAffine(img, mat, (width, height), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0))
+
+            if not stamp_pil_in_opencv:
+                static_png = f"{seg_out}.static.png"
+                cv2.imwrite(static_png, static_frame)
                 try:
-                    _write_raw_frame(proc.stdin, frame, use_yuv)
-                except BrokenPipeError:
-                    break
+                    if use_ffmpeg_png_subs:
+                        cmd = _build_filtered_png_ffmpeg_args(
+                            ["-loop", "1", "-framerate", str(fps), "-i", static_png, "-t", f"{dur:.3f}"],
+                            vf_post_parts,
+                        )
+                    else:
+                        cmd = [
+                            "ffmpeg", "-y", "-loglevel", "error",
+                            "-loop", "1", "-framerate", str(fps), "-i", static_png,
+                            "-t", f"{dur:.3f}",
+                        ]
+                        if vf_post_parts:
+                            cmd.extend(["-vf", ",".join(vf_post_parts)])
+                        cmd.extend([*v_enc_args, "-an", seg_out])
+                    run_cmd(cmd, f"Renderizar clipe estático {idx+1}")
+                finally:
+                    try:
+                        if os.path.exists(static_png):
+                            os.remove(static_png)
+                    except Exception:
+                        pass
+                return
+
+            # Imagem estática + legendas Pillow diretas na RAM (muito rápido e fiel)
+            use_yuv = (width % 2 == 0 and height % 2 == 0)
+            ff_cmd = [
+                "ffmpeg", "-y",
+                "-f", "rawvideo",
+                "-pix_fmt", "yuv420p" if use_yuv else "bgr24",
+                "-s", f"{width}x{height}",
+                "-r", str(fps),
+                "-i", "pipe:0",
+                *v_enc_args, "-an", seg_out,
+            ]
+            proc, stderr_chunks, stderr_thread = _start_ffmpeg_pipe(ff_cmd)
+            try:
+                base_yuv = cv2.cvtColor(static_frame, cv2.COLOR_BGR2YUV_I420) if use_yuv else None
+                for f_idx in range(total_frames):
+                    cur_t = clip_timeline_start + (f_idx / float(fps))
+                    active_sub = _find_active_pil_overlay(pil_overlay_cache, cur_t)
+                    try:
+                        if active_sub is None and base_yuv is not None:
+                            proc.stdin.write(memoryview(base_yuv))
+                        elif active_sub is None:
+                            proc.stdin.write(memoryview(np.ascontiguousarray(static_frame)))
+                        else:
+                            frm = static_frame.copy()
+                            _stamp_pil_subtitle(frm, active_sub[2], cur_t, active_sub[0], active_sub[1])
+                            _write_raw_frame(proc.stdin, frm, use_yuv)
+                    except BrokenPipeError:
+                        break
+            finally:
+                _close_and_wait_ffmpeg(proc, stderr_chunks, stderr_thread, f"Erro OpenCV+FFmpeg estático clipe {idx+1}")
+            return
+
+        use_yuv = (width % 2 == 0 and height % 2 == 0)
+        base_pipe_args = [
+            "-f", "rawvideo",
+            "-pix_fmt", "yuv420p" if use_yuv else "bgr24",
+            "-s", f"{width}x{height}",
+            "-r", str(fps),
+            "-i", "pipe:0",
+        ]
+        if use_ffmpeg_png_subs:
+            ff_cmd = _build_filtered_png_ffmpeg_args(base_pipe_args, vf_post_parts)
         else:
-            cap = cv2.VideoCapture(src_path)
-            if not cap.isOpened():
-                raise RuntimeError(f"OpenCV não conseguiu abrir vídeo: {src_path}")
-            vid_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-            vid_frames = []
-            while True:
-                ok, frm = cap.read()
-                if not ok:
-                    break
-                vid_frames.append(_resize_oversized_src(frm, width, height))
-            cap.release()
-            if not vid_frames:
-                raise RuntimeError(f"Vídeo sem frames legíveis: {src_path}")
-            src_h, src_w = vid_frames[0].shape[:2]
-            n_vid = len(vid_frames)
-            for f_idx in range(total_frames):
-                progress = f_idx / float(max(1, total_frames - 1))
-                t_sec = f_idx / float(fps)
-                src_frame_idx = int((t_sec * speed) * vid_fps) % n_vid
-                scale, tx, ty = compute_capcut_transform(movement, camera_effect, progress, width, height, dur, rng)
-                mat = build_affine_matrix(src_w, src_h, width, height, scale, tx, ty, custom_transform)
-                frame = cv2.warpAffine(vid_frames[src_frame_idx], mat, (width, height), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0))
-                if trans_frames > 0 and f_idx < trans_frames:
-                    p = (f_idx + 1) / float(trans_frames + 1)
-                    frame = blend_transition_frames(prev_end_frame, frame, tr_name, p, width, height)
-                try:
-                    _write_raw_frame(proc.stdin, frame, use_yuv)
-                except BrokenPipeError:
-                    break
+            ff_cmd = ["ffmpeg", "-y", *base_pipe_args]
+            if vf_post_parts:
+                ff_cmd.extend(["-vf", ",".join(vf_post_parts)])
+            ff_cmd.extend([*v_enc_args, "-an", seg_out])
+
+        proc, stderr_chunks, stderr_thread = _start_ffmpeg_pipe(ff_cmd)
+        rng = random.Random(10007 * (idx + 1))
+
+        try:
+            if not is_video:
+                img = cv2.imread(src_path, cv2.IMREAD_COLOR)
+                if img is None:
+                    raise RuntimeError(f"OpenCV não conseguiu abrir imagem: {src_path}")
+                img = _resize_oversized_src(img, width, height)
+                src_h, src_w = img.shape[:2]
+                for f_idx in range(total_frames):
+                    progress = f_idx / float(max(1, total_frames - 1))
+                    scale, tx, ty = compute_capcut_transform(movement, camera_effect, progress, width, height, dur, rng)
+                    mat = build_affine_matrix(src_w, src_h, width, height, scale, tx, ty, custom_transform)
+                    frame = cv2.warpAffine(img, mat, (width, height), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0))
+                    if trans_frames > 0 and f_idx < trans_frames:
+                        p = (f_idx + 1) / float(trans_frames + 1)
+                        frame = blend_transition_frames(prev_end_frame, frame, tr_name, p, width, height)
+                    if stamp_pil_in_opencv:
+                        cur_t = clip_timeline_start + (f_idx / float(fps))
+                        active_sub = _find_active_pil_overlay(pil_overlay_cache, cur_t)
+                        if active_sub is not None:
+                            _stamp_pil_subtitle(frame, active_sub[2], cur_t, active_sub[0], active_sub[1])
+                    try:
+                        _write_raw_frame(proc.stdin, frame, use_yuv)
+                    except BrokenPipeError:
+                        break
+            else:
+                cap = cv2.VideoCapture(src_path)
+                if not cap.isOpened():
+                    raise RuntimeError(f"OpenCV não conseguiu abrir vídeo: {src_path}")
+                vid_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+                vid_frames = []
+                while True:
+                    ok, frm = cap.read()
+                    if not ok:
+                        break
+                    vid_frames.append(_resize_oversized_src(frm, width, height))
+                cap.release()
+                if not vid_frames:
+                    raise RuntimeError(f"Vídeo sem frames legíveis: {src_path}")
+                src_h, src_w = vid_frames[0].shape[:2]
+                n_vid = len(vid_frames)
+                for f_idx in range(total_frames):
+                    progress = f_idx / float(max(1, total_frames - 1))
+                    t_sec = f_idx / float(fps)
+                    src_frame_idx = int((t_sec * speed) * vid_fps) % n_vid
+                    scale, tx, ty = compute_capcut_transform(movement, camera_effect, progress, width, height, dur, rng)
+                    mat = build_affine_matrix(src_w, src_h, width, height, scale, tx, ty, custom_transform)
+                    frame = cv2.warpAffine(vid_frames[src_frame_idx], mat, (width, height), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0))
+                    if trans_frames > 0 and f_idx < trans_frames:
+                        p = (f_idx + 1) / float(trans_frames + 1)
+                        frame = blend_transition_frames(prev_end_frame, frame, tr_name, p, width, height)
+                    if stamp_pil_in_opencv:
+                        cur_t = clip_timeline_start + t_sec
+                        active_sub = _find_active_pil_overlay(pil_overlay_cache, cur_t)
+                        if active_sub is not None:
+                            _stamp_pil_subtitle(frame, active_sub[2], cur_t, active_sub[0], active_sub[1])
+                    try:
+                        _write_raw_frame(proc.stdin, frame, use_yuv)
+                    except BrokenPipeError:
+                        break
+        finally:
+            _close_and_wait_ffmpeg(proc, stderr_chunks, stderr_thread, f"Erro OpenCV+FFmpeg clipe {idx+1}")
     finally:
-        _close_and_wait_ffmpeg(proc, stderr_chunks, stderr_thread, f"Erro OpenCV+FFmpeg clipe {idx+1}")
+        for tp in temp_sub_pngs:
+            try:
+                if os.path.exists(tp):
+                    os.remove(tp)
+            except Exception:
+                pass
+        return
+
+
 
 
 def _hex_to_bgr(hex_str: str, default=(255, 255, 255)) -> tuple[int, int, int]:
@@ -780,9 +899,10 @@ def composite_characters_opencv(
     fps: int,
     v_enc_args: list[str],
     sub_filter: str | None = None,
+    subtitle_items: list[dict] | None = None,
+    subtitle_config: dict | None = None,
 ):
-    """Composita fundo + efeito + personagem animado em sub-pixel (+ legendas em 1 único passe) sobre o vídeo."""
-    # Pré-carrega PNGs dos personagens com canal alpha e pré-renderiza camadas de fundo/efeito
+    """Composita fundo + efeito + personagem animado em sub-pixel (+ legendas Pillow Canvas-idênticas em 1 único passe)."""
     char_img_cache = {}
     bg_effect_cache = {}
     windows = []
@@ -839,6 +959,17 @@ def composite_characters_opencv(
         c_end = c_start + float(ch_meta.get("duration", 10))
         windows.append((c_start, c_end, char_img_cache[c_path], ch_meta, bg_effect_cache[bg_key]))
 
+    use_pil_subs = bool(HAS_PIL and subtitle_items)
+    pil_sub_windows: list[tuple[float, float, str]] = []
+    pil_sub_rendered: dict[int, dict | None] = {}
+    if use_pil_subs:
+        for item in subtitle_items:
+            txt = str(item.get("text") or "").strip()
+            s_t = float(item.get("start") or 0.0)
+            e_t = max(s_t + 0.05, float(item.get("end") or (s_t + 1.0)))
+            if txt:
+                pil_sub_windows.append((s_t, e_t, txt))
+
     cap = cv2.VideoCapture(visual_video_path)
     if not cap.isOpened():
         raise RuntimeError(f"OpenCV não conseguiu abrir vídeo concatenado: {visual_video_path}")
@@ -853,7 +984,7 @@ def composite_characters_opencv(
         "-r", f"{vid_fps:.3f}",
         "-i", "pipe:0",
     ]
-    if sub_filter:
+    if sub_filter and not use_pil_subs:
         ff_cmd.extend(["-vf", sub_filter])
     ff_cmd.extend([
         *v_enc_args,
@@ -983,6 +1114,18 @@ def composite_characters_opencv(
                     char_u16 = warped_char[:, :, :3].astype(np.uint16)
                     blended = ((roi_u16 * inv_alpha_u16 + char_u16 * alpha_u16) * 257) >> 16
                     frame[by0:by1, bx0:bx1] = blended.astype(np.uint8)
+
+            if use_pil_subs and pil_sub_windows:
+                for s_idx, (ss_t, se_t, s_txt) in enumerate(pil_sub_windows):
+                    if ss_t <= cur_t < se_t:
+                        if s_idx not in pil_sub_rendered:
+                            pil_sub_rendered[s_idx] = _render_pil_subtitle_overlay(
+                                s_txt, subtitle_config or {}, width, height
+                            )
+                        ov = pil_sub_rendered[s_idx]
+                        if ov is not None:
+                            _stamp_pil_subtitle(frame, ov, cur_t, ss_t, se_t)
+                        break
 
             try:
                 _write_raw_frame(proc.stdin, frame, use_yuv)
@@ -1388,6 +1531,458 @@ def upload_to_temp_cloud(file_path: str, job_id: str = "job") -> tuple[str | Non
 
 
 # ==============================================================================
+# RENDERIZADOR DE LEGENDAS CANVAS-IDÊNTICO (PILLOW RGBA + FONTES + CANTOS ARREDONDADOS)
+# ==============================================================================
+
+_FONT_PATH_CACHE: dict[str, str] = {}
+
+
+def _hex_to_rgb(hex_str: str, default=(255, 255, 255)) -> tuple[int, int, int]:
+    s = (hex_str or "").strip().lstrip("#")
+    if len(s) == 3:
+        s = "".join(c * 2 for c in s)
+    if len(s) < 6:
+        return default
+    try:
+        return (int(s[0:2], 16), int(s[2:4], 16), int(s[4:6], 16))
+    except Exception:
+        return default
+
+
+def _resolve_pil_font_path(role: str) -> str | None:
+    if role in _FONT_PATH_CACHE:
+        return _FONT_PATH_CACHE[role] or None
+
+    fc_queries_and_paths = {
+        "sans_black": (
+            ["Liberation Sans:style=Bold", "Roboto:style=Black", "Roboto:style=Bold", "DejaVu Sans:style=Bold"],
+            [
+                "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+                "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
+                "/usr/share/fonts/truetype/roboto/unhinted/RobotoTTF/Roboto-Black.ttf",
+                "/usr/share/fonts/truetype/roboto/Roboto-Bold.ttf",
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            ],
+        ),
+        "sans_italic_bold": (
+            ["Liberation Sans:style=Bold Italic", "Roboto:style=Bold Italic", "DejaVu Sans:style=Bold Oblique"],
+            [
+                "/usr/share/fonts/truetype/liberation/LiberationSans-BoldItalic.ttf",
+                "/usr/share/fonts/truetype/liberation2/LiberationSans-BoldItalic.ttf",
+                "/usr/share/fonts/truetype/roboto/Roboto-BoldItalic.ttf",
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans-BoldOblique.ttf",
+            ],
+        ),
+        "roboto_bold": (
+            ["Roboto:style=Black", "Roboto:style=Bold", "Liberation Sans:style=Bold", "DejaVu Sans:style=Bold"],
+            [
+                "/usr/share/fonts/truetype/roboto/unhinted/RobotoTTF/Roboto-Black.ttf",
+                "/usr/share/fonts/truetype/roboto/unhinted/RobotoTTF/Roboto-Bold.ttf",
+                "/usr/share/fonts/truetype/roboto/Roboto-Bold.ttf",
+                "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            ],
+        ),
+        "roboto_med": (
+            ["Roboto:style=Medium", "Roboto:style=Regular", "Liberation Sans:style=Regular", "DejaVu Sans:style=Book"],
+            [
+                "/usr/share/fonts/truetype/roboto/unhinted/RobotoTTF/Roboto-Medium.ttf",
+                "/usr/share/fonts/truetype/roboto/unhinted/RobotoTTF/Roboto-Regular.ttf",
+                "/usr/share/fonts/truetype/roboto/Roboto-Medium.ttf",
+                "/usr/share/fonts/truetype/roboto/Roboto-Regular.ttf",
+                "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            ],
+        ),
+        "comic": (
+            ["Comic Neue:style=Bold", "Comic Sans MS:style=Bold", "DejaVu Sans:style=Bold"],
+            [
+                "/usr/share/fonts/truetype/comic-neue/ComicNeue-Bold.ttf",
+                "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            ],
+        ),
+        "serif_italic": (
+            ["Liberation Serif:style=Italic", "DejaVu Serif:style=Italic"],
+            [
+                "/usr/share/fonts/truetype/liberation/LiberationSerif-Italic.ttf",
+                "/usr/share/fonts/truetype/dejavu/DejaVuSerif-Italic.ttf",
+            ],
+        ),
+        "serif_bold": (
+            ["Liberation Serif:style=Bold", "DejaVu Serif:style=Bold"],
+            [
+                "/usr/share/fonts/truetype/liberation/LiberationSerif-Bold.ttf",
+                "/usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf",
+            ],
+        ),
+    }
+
+    queries, fallbacks = fc_queries_and_paths.get(role, fc_queries_and_paths["sans_black"])
+    resolved = None
+    fc_bin = shutil.which("fc-match")
+    if fc_bin:
+        for q in queries:
+            try:
+                p = subprocess.check_output([fc_bin, "-f", "%{file}", q], text=True, stderr=subprocess.DEVNULL).strip()
+                if p and os.path.exists(p):
+                    resolved = p
+                    break
+            except Exception:
+                pass
+
+    if not resolved:
+        for fp in fallbacks:
+            if os.path.exists(fp):
+                resolved = fp
+                break
+
+    _FONT_PATH_CACHE[role] = resolved or ""
+    return resolved
+
+
+def _load_pil_font(role: str, size_px: int):
+    sz = max(10, int(round(size_px)))
+    fp = _resolve_pil_font_path(role)
+    if fp:
+        try:
+            return ImageFont.truetype(fp, sz)
+        except Exception:
+            pass
+    return ImageFont.load_default()
+
+
+def _render_pil_subtitle_overlay(
+    text: str,
+    sub_config: dict,
+    width: int,
+    height: int,
+) -> dict | None:
+    """Desenha 1 legenda idêntica ao Canvas de FinalizarVideo.tsx em caixa RGBA recortada e pronta para compor em OpenCV."""
+    if not HAS_PIL:
+        return None
+
+    lines = [ln for ln in str(text or "").split("\n") if ln]
+    if not lines:
+        return None
+
+    style = str((sub_config or {}).get("style") or "classic")
+    sub_color = str((sub_config or {}).get("color") or "")
+    sub_scale = float((sub_config or {}).get("scale") or 1.0)
+
+    ref_side = min(width, height)
+    x = width / 2.0
+    margin = height * 0.07
+    y = height - margin
+
+    canvas_img = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(canvas_img)
+
+    def _draw_shadow_layer(draw_fn, ox: float, oy: float, blur_r: float):
+        if blur_r <= 0.4:
+            sh = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+            sd = ImageDraw.Draw(sh)
+            draw_fn(sd, ox, oy)
+            canvas_img.alpha_composite(sh)
+            return
+        sh = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+        sd = ImageDraw.Draw(sh)
+        draw_fn(sd, ox, oy)
+        sh = sh.filter(ImageFilter.GaussianBlur(radius=float(blur_r)))
+        canvas_img.alpha_composite(sh)
+
+    def _measure_max_w(font_obj) -> float:
+        mw = 40.0
+        for ln in lines:
+            try:
+                w_ln = float(draw.textlength(ln, font=font_obj))
+            except Exception:
+                bb = draw.textbbox((0, 0), ln, font=font_obj)
+                w_ln = float(bb[2] - bb[0])
+            if w_ln > mw:
+                mw = w_ln
+        return mw
+
+    is_karaoke = style == "karaoke"
+    active_overlay_arr = None
+    text_left_x = width
+    text_right_x = 0
+
+    if style in ("impact", "mrbeast", "hormozi"):
+        font_size = max(12, int(math.floor(ref_side * 0.056 * sub_scale)))
+        line_h = font_size * 1.32
+        font = _load_pil_font("sans_italic_bold" if style == "impact" else "sans_black", font_size)
+        _, descent = font.getmetrics()
+        sw_canvas = max(4, int(math.floor(ref_side * 0.014)))
+        sw = max(2, int(round(sw_canvas * 0.5)))
+        sh_oy = max(2, int(math.floor(ref_side * 0.006)))
+        sh_blur = max(1.0, math.floor(ref_side * 0.01) * 0.65)
+
+        def _paint_sh(sd, ox, oy):
+            for i, ln in enumerate(lines):
+                ly = y - (len(lines) - 1 - i) * line_h
+                by = ly - descent
+                sd.text((x + ox, by + oy), ln, font=font, fill=(0, 0, 0, 242), stroke_width=sw, stroke_fill=(0, 0, 0, 242), anchor="ms")
+
+        _draw_shadow_layer(_paint_sh, 0.0, float(sh_oy), sh_blur)
+        for i, ln in enumerate(lines):
+            ly = y - (len(lines) - 1 - i) * line_h
+            by = ly - descent
+            if style == "hormozi":
+                rgb = (255, 255, 255) if (i % 2 == 0) else _hex_to_rgb(sub_color, (74, 222, 128))
+            elif style == "mrbeast":
+                rgb = _hex_to_rgb(sub_color, (250, 204, 21))
+            else:
+                rgb = _hex_to_rgb(sub_color, (255, 255, 255))
+            draw.text((x, by), ln, font=font, fill=(*rgb, 255), stroke_width=sw, stroke_fill=(0, 0, 0, 255), anchor="ms")
+
+    elif style in ("tiktok-yellow", "tiktok-black", "capcut-box", "badge-purple", "youtube", "youtube-amarelo", "youtube-shorts"):
+        is_yt = style in ("youtube", "youtube-amarelo")
+        font_size = max(12, int(math.floor(ref_side * (0.041 if is_yt else 0.046) * sub_scale)))
+        line_h = font_size * 1.38
+        font = _load_pil_font("roboto_med" if is_yt else "roboto_bold", font_size)
+        _, descent = font.getmetrics()
+        pad_x = max(16.0, width * 0.024)
+        pad_y = max(8.0, height * 0.011)
+        max_w = _measure_max_w(font)
+        rect_w = max_w + pad_x * 2.0
+        total_h = len(lines) * line_h
+        rect_h = total_h + pad_y * 1.6
+        rx = x - rect_w / 2.0
+        ry = y - total_h - pad_y * 0.5
+        rad = 6 if is_yt else 12
+
+        box_rgba_map = {
+            "tiktok-yellow": (255, 221, 0, 255),
+            "tiktok-black": (0, 0, 0, 230),
+            "capcut-box": (17, 24, 39, 209),
+            "badge-purple": (124, 58, 237, 255),
+            "youtube-shorts": (220, 38, 38, 255),
+            "youtube": (8, 8, 8, 199),
+            "youtube-amarelo": (8, 8, 8, 199),
+        }
+        box_rgba = box_rgba_map.get(style, (8, 8, 8, 199))
+        draw.rounded_rectangle([rx, ry, rx + rect_w, ry + rect_h], radius=rad, fill=box_rgba)
+
+        if style == "tiktok-yellow":
+            txt_rgba = (0, 0, 0, 255)
+        elif style == "youtube-amarelo":
+            txt_rgba = (250, 204, 21, 255)
+        else:
+            txt_rgba = (255, 255, 255, 255)
+
+        for i, ln in enumerate(lines):
+            ly = y - (len(lines) - 1 - i) * line_h
+            by = (ly - pad_y * 0.25) - descent
+            draw.text((x, by), ln, font=font, fill=txt_rgba, anchor="ms")
+
+    elif style == "neon":
+        font_size = max(12, int(math.floor(ref_side * 0.052 * sub_scale)))
+        line_h = font_size * 1.35
+        font = _load_pil_font("sans_black", font_size)
+        _, descent = font.getmetrics()
+        glow_blur = max(4.0, math.floor(ref_side * 0.022) * 0.70)
+
+        def _paint_neon_glow(sd, ox, oy):
+            for i, ln in enumerate(lines):
+                ly = y - (len(lines) - 1 - i) * line_h
+                sd.text((x + ox, (ly - descent) + oy), ln, font=font, fill=(6, 182, 212, 255), anchor="ms")
+
+        def _paint_neon_drop(sd, ox, oy):
+            for i, ln in enumerate(lines):
+                ly = y - (len(lines) - 1 - i) * line_h
+                sd.text((x + ox, (ly - descent) + oy), ln, font=font, fill=(0, 0, 0, 217), anchor="ms")
+
+        _draw_shadow_layer(_paint_neon_glow, 0.0, 0.0, glow_blur)
+        _draw_shadow_layer(_paint_neon_glow, 0.0, 0.0, max(2.0, glow_blur * 0.45))
+        _draw_shadow_layer(_paint_neon_drop, 2.0, 2.0, 1.5)
+        for i, ln in enumerate(lines):
+            ly = y - (len(lines) - 1 - i) * line_h
+            draw.text((x, ly - descent), ln, font=font, fill=(34, 211, 238, 255), anchor="ms")
+
+    elif style == "netflix":
+        font_size = max(12, int(math.floor(ref_side * 0.042 * sub_scale)))
+        line_h = font_size * 1.38
+        font = _load_pil_font("sans_black", font_size)
+        _, descent = font.getmetrics()
+        sw = max(1, int(round(max(2, math.floor(ref_side * 0.004)) * 0.5)))
+
+        def _paint_nf(sd, ox, oy):
+            for i, ln in enumerate(lines):
+                ly = y - (len(lines) - 1 - i) * line_h
+                sd.text((x + ox, (ly - descent) + oy), ln, font=font, fill=(0, 0, 0, 230), stroke_width=sw, stroke_fill=(0, 0, 0, 230), anchor="ms")
+
+        _draw_shadow_layer(_paint_nf, 0.0, 2.0, 2.5)
+        for i, ln in enumerate(lines):
+            ly = y - (len(lines) - 1 - i) * line_h
+            draw.text((x, ly - descent), ln, font=font, fill=(250, 204, 21, 255), stroke_width=sw, stroke_fill=(0, 0, 0, 255), anchor="ms")
+
+    elif style == "comic":
+        font_size = max(12, int(math.floor(ref_side * 0.052 * sub_scale)))
+        line_h = font_size * 1.35
+        font = _load_pil_font("comic", font_size)
+        _, descent = font.getmetrics()
+        sw = max(2, int(round(max(3, math.floor(ref_side * 0.01)) * 0.5)))
+        for i, ln in enumerate(lines):
+            ly = y - (len(lines) - 1 - i) * line_h
+            by = ly - descent
+            draw.text((x + 3.0, by + 3.0), ln, font=font, fill=(0, 0, 0, 255), stroke_width=sw, stroke_fill=(0, 0, 0, 255), anchor="ms")
+            draw.text((x, by), ln, font=font, fill=(255, 235, 59, 255), stroke_width=sw, stroke_fill=(0, 0, 0, 255), anchor="ms")
+
+    elif style == "karaoke":
+        font_size = max(12, int(math.floor(ref_side * 0.056 * sub_scale)))
+        line_h = font_size * 1.34
+        font = _load_pil_font("sans_black", font_size)
+        _, descent = font.getmetrics()
+        sw = max(2, int(round(max(4, math.floor(ref_side * 0.014)) * 0.5)))
+        sh_oy = max(2, int(math.floor(ref_side * 0.006)))
+        sh_blur = max(1.0, math.floor(ref_side * 0.01) * 0.65)
+        max_w = _measure_max_w(font)
+        text_left_x = int(math.floor(x - max_w / 2.0))
+        text_right_x = int(math.ceil(x + max_w / 2.0))
+
+        def _paint_kar_sh(sd, ox, oy):
+            for i, ln in enumerate(lines):
+                ly = y - (len(lines) - 1 - i) * line_h
+                sd.text((x + ox, (ly - descent) + oy), ln, font=font, fill=(0, 0, 0, 242), stroke_width=sw, stroke_fill=(0, 0, 0, 242), anchor="ms")
+
+        _draw_shadow_layer(_paint_kar_sh, 0.0, float(sh_oy), sh_blur)
+        active_img = canvas_img.copy()
+        active_draw = ImageDraw.Draw(active_img)
+        active_rgb = _hex_to_rgb(sub_color, (255, 255, 0))
+        for i, ln in enumerate(lines):
+            ly = y - (len(lines) - 1 - i) * line_h
+            by = ly - descent
+            draw.text((x, by), ln, font=font, fill=(255, 255, 255, 255), stroke_width=sw, stroke_fill=(0, 0, 0, 255), anchor="ms")
+            active_draw.text((x, by), ln, font=font, fill=(*active_rgb, 255), stroke_width=sw, stroke_fill=(0, 0, 0, 255), anchor="ms")
+
+        active_overlay_arr = np.array(active_img, dtype=np.uint8)
+
+    elif style in ("elegant", "documentary"):
+        font_size = max(12, int(math.floor(ref_side * 0.044 * sub_scale)))
+        line_h = font_size * 1.40
+        font = _load_pil_font("serif_italic" if style == "elegant" else "serif_bold", font_size)
+        _, descent = font.getmetrics()
+        sw = max(1, int(round(max(2, math.floor(ref_side * 0.004)) * 0.5)))
+
+        def _paint_ed(sd, ox, oy):
+            for i, ln in enumerate(lines):
+                ly = y - (len(lines) - 1 - i) * line_h
+                sd.text((x + ox, (ly - descent) + oy), ln, font=font, fill=(0, 0, 0, 204), stroke_width=sw, stroke_fill=(0, 0, 0, 204), anchor="ms")
+
+        _draw_shadow_layer(_paint_ed, 0.0, 3.0, 4.5)
+        rgb = (248, 250, 252) if style == "documentary" else (255, 255, 255)
+        for i, ln in enumerate(lines):
+            ly = y - (len(lines) - 1 - i) * line_h
+            draw.text((x, ly - descent), ln, font=font, fill=(*rgb, 255), stroke_width=sw, stroke_fill=(0, 0, 0, 217), anchor="ms")
+
+    else:
+        # clean-white, classic & youtube-vlogger
+        font_size = max(12, int(math.floor(ref_side * 0.046 * sub_scale)))
+        line_h = font_size * 1.38
+        font = _load_pil_font("roboto_bold" if style == "youtube-vlogger" else "sans_black", font_size)
+        _, descent = font.getmetrics()
+        sw = max(1, int(round(max(2, math.floor(ref_side * 0.006)) * 0.5)))
+
+        def _paint_std(sd, ox, oy):
+            for i, ln in enumerate(lines):
+                ly = y - (len(lines) - 1 - i) * line_h
+                sd.text((x + ox, (ly - descent) + oy), ln, font=font, fill=(0, 0, 0, 217), stroke_width=sw, stroke_fill=(0, 0, 0, 217), anchor="ms")
+
+        _draw_shadow_layer(_paint_std, 0.0, 2.0, 2.5)
+        rgb = _hex_to_rgb(sub_color, (255, 255, 255)) if style == "clean-white" else (255, 255, 255)
+        for i, ln in enumerate(lines):
+            ly = y - (len(lines) - 1 - i) * line_h
+            draw.text((x, ly - descent), ln, font=font, fill=(*rgb, 255), stroke_width=sw, stroke_fill=(0, 0, 0, 235), anchor="ms")
+
+    bbox = canvas_img.getbbox()
+    if not bbox:
+        return None
+
+    bx0 = max(0, bbox[0] - 2)
+    by0 = max(0, bbox[1] - 2)
+    bx1 = min(width, bbox[2] + 2)
+    by1 = min(height, bbox[3] + 2)
+    if bx1 <= bx0 or by1 <= by0:
+        return None
+
+    crop_rgba = np.array(canvas_img.crop((bx0, by0, bx1, by1)), dtype=np.uint8)
+    bgr_u16 = crop_rgba[:, :, :3][:, :, ::-1].astype(np.uint16)
+    alpha_u16 = crop_rgba[:, :, 3:4].astype(np.uint16)
+    inv_u16 = 255 - alpha_u16
+
+    out = {
+        "bx0": bx0,
+        "by0": by0,
+        "bx1": bx1,
+        "by1": by1,
+        "bgr_u16": bgr_u16,
+        "alpha_u16": alpha_u16,
+        "inv_u16": inv_u16,
+        "rgba": crop_rgba,
+        "karaoke": False,
+    }
+
+    if is_karaoke and active_overlay_arr is not None:
+        act_crop = active_overlay_arr[by0:by1, bx0:bx1]
+        out["karaoke"] = True
+        out["act_bgr_u16"] = act_crop[:, :, :3][:, :, ::-1].astype(np.uint16)
+        out["act_alpha_u16"] = act_crop[:, :, 3:4].astype(np.uint16)
+        out["act_inv_u16"] = 255 - out["act_alpha_u16"]
+        out["t_left"] = max(0, text_left_x - bx0)
+        out["t_right"] = min(bx1 - bx0, text_right_x - bx0)
+
+    return out
+
+
+def _save_overlay_png(ov: dict, dest_path: str) -> None:
+    rgba = ov["rgba"]
+    bgra = rgba[:, :, [2, 1, 0, 3]]
+    cv2.imwrite(dest_path, bgra)
+
+
+def _prepare_clip_pil_overlays(pil_subs: list[dict], sub_config: dict, width: int, height: int) -> list[tuple[float, float, dict]]:
+    rendered: list[tuple[float, float, dict]] = []
+    for item in pil_subs:
+        s_t = float(item.get("start") or 0.0)
+        e_t = max(s_t + 0.05, float(item.get("end") or (s_t + 1.0)))
+        txt = str(item.get("text") or "").strip()
+        if not txt:
+            continue
+        ov = _render_pil_subtitle_overlay(txt, sub_config, width, height)
+        if ov is not None:
+            rendered.append((s_t, e_t, ov))
+    return rendered
+
+
+def _find_active_pil_overlay(overlays: list[tuple[float, float, dict]], cur_t: float):
+    for s_t, e_t, ov in overlays:
+        if s_t <= cur_t < e_t:
+            return (s_t, e_t, ov)
+    return None
+
+
+def _stamp_pil_subtitle(frame: np.ndarray, ov: dict, cur_t: float, s_t: float, e_t: float) -> None:
+    bx0, by0, bx1, by1 = ov["bx0"], ov["by0"], ov["bx1"], ov["by1"]
+    roi_u16 = frame[by0:by1, bx0:bx1].astype(np.uint16)
+
+    if ov.get("karaoke"):
+        prog = max(0.0, min(1.0, (cur_t - s_t) / max(0.1, e_t - s_t)))
+        tl = ov["t_left"]
+        tr = ov["t_right"]
+        split_x = max(0, min(bx1 - bx0, int(round(tl + (tr - tl) * prog))))
+        out_roi = ((roi_u16 * ov["inv_u16"] + ov["bgr_u16"] * ov["alpha_u16"]) * 257) >> 16
+        if split_x > 0:
+            act_part = ((roi_u16[:, :split_x] * ov["act_inv_u16"][:, :split_x] + ov["act_bgr_u16"][:, :split_x] * ov["act_alpha_u16"][:, :split_x]) * 257) >> 16
+            out_roi[:, :split_x] = act_part
+        frame[by0:by1, bx0:bx1] = out_roi.astype(np.uint8)
+        return
+
+    blended = ((roi_u16 * ov["inv_u16"] + ov["bgr_u16"] * ov["alpha_u16"]) * 257) >> 16
+    frame[by0:by1, bx0:bx1] = blended.astype(np.uint8)
+
+
+# ==============================================================================
 # PARSING DE LEGENDAS & WORKER MULTIPROCESSADO DE CLIPES
 # ==============================================================================
 
@@ -1450,6 +2045,8 @@ def _render_clip_worker(task_args: tuple) -> tuple[int, str]:
         clip_timeline_start,
         sub_filter,
         clip_needs_sub,
+        pil_clip_subs,
+        sub_config,
     ) = task_args
 
     if HAS_OPENCV:
@@ -1462,11 +2059,48 @@ def _render_clip_worker(task_args: tuple) -> tuple[int, str]:
     seg_out = os.path.join(work_dir, f"seg_{idx+1:04d}.mp4")
     src_path = clip_paths.get(idx)
 
+    use_pil_here = bool(HAS_PIL and HAS_OPENCV and pil_clip_subs)
+
     sub_vf = None
-    if sub_filter and clip_needs_sub:
+    if sub_filter and clip_needs_sub and not use_pil_here:
         sub_vf = f"setpts=PTS+{clip_timeline_start:.3f}/TB,{sub_filter},setpts=PTS-STARTPTS"
 
     if not src_path or not os.path.exists(src_path):
+        if use_pil_here:
+            pil_overlays = _prepare_clip_pil_overlays(pil_clip_subs, sub_config or {}, width, height)
+            use_yuv = (width % 2 == 0 and height % 2 == 0)
+            total_frames = max(2, int(round(dur * fps)))
+            ff_cmd = [
+                "ffmpeg", "-y",
+                "-f", "rawvideo",
+                "-pix_fmt", "yuv420p" if use_yuv else "bgr24",
+                "-s", f"{width}x{height}",
+                "-r", str(fps),
+                "-i", "pipe:0",
+                *v_enc_args, "-an", seg_out,
+            ]
+            proc, stderr_chunks, stderr_thread = _start_ffmpeg_pipe(ff_cmd)
+            try:
+                black_frm = np.zeros((height, width, 3), dtype=np.uint8)
+                black_yuv = cv2.cvtColor(black_frm, cv2.COLOR_BGR2YUV_I420) if use_yuv else None
+                for f_idx in range(total_frames):
+                    cur_t = clip_timeline_start + (f_idx / float(fps))
+                    active_sub = _find_active_pil_overlay(pil_overlays, cur_t)
+                    try:
+                        if active_sub is None and black_yuv is not None:
+                            proc.stdin.write(memoryview(black_yuv))
+                        elif active_sub is None:
+                            proc.stdin.write(memoryview(black_frm))
+                        else:
+                            frm = black_frm.copy()
+                            _stamp_pil_subtitle(frm, active_sub[2], cur_t, active_sub[0], active_sub[1])
+                            _write_raw_frame(proc.stdin, frm, use_yuv)
+                    except BrokenPipeError:
+                        break
+            finally:
+                _close_and_wait_ffmpeg(proc, stderr_chunks, stderr_thread, f"Erro clipe preto+legenda {idx+1}")
+            return idx, seg_out
+
         cmd = [
             "ffmpeg", "-y", "-loglevel", "error",
             "-f", "lavfi", "-i", f"color=c=black:s={width}x{height}:r={fps}:d={dur:.3f}",
@@ -1502,7 +2136,7 @@ def _render_clip_worker(task_args: tuple) -> tuple[int, str]:
     tr_dur = float(clip.get("transitionDuration") or 0.5)
     has_tr_in = (idx > 0 or authentic_intro_secs > 0.05) and tr_name not in ("", "none") and tr_dur > 0.05
 
-    if HAS_OPENCV and (clip.get("type") != "video" or needs_motion or has_tr_in):
+    if HAS_OPENCV and (clip.get("type") != "video" or needs_motion or has_tr_in or use_pil_here):
         prev_end_frame = (
             get_prev_clip_end_frame(idx, clips, clip_paths, width, height, authentic_intro_secs)
             if has_tr_in
@@ -1522,6 +2156,10 @@ def _render_clip_worker(task_args: tuple) -> tuple[int, str]:
             prev_end_frame=prev_end_frame,
             tr_name=tr_name if has_tr_in else "none",
             tr_dur=tr_dur if has_tr_in else 0.0,
+            pil_subs=pil_clip_subs if use_pil_here else None,
+            sub_config=sub_config,
+            clip_timeline_start=clip_timeline_start,
+            work_dir=work_dir,
         )
         return idx, seg_out
 
@@ -1583,6 +2221,8 @@ def handler(job):
         character_overlays = inp.get("characterOverlays", [])
         subtitles_ass = inp.get("subtitlesAss", "")
         subtitles_srt = inp.get("subtitlesSrt", "")
+        subtitle_items = inp.get("subtitleItems") or []
+        subtitle_config = inp.get("subtitleConfig") or {}
         callback_upload_url = inp.get("callbackUploadUrl", "")
         authentic_intro_secs = float(inp.get("authenticIntroSecs", 0))
 
@@ -1603,7 +2243,8 @@ def handler(job):
             crf_val = "18" if preset_mode == "high" else ("26" if preset_mode == "fast" else "21")
             v_enc_args = ["-c:v", "libx264", "-preset", preset_flag, "-crf", crf_val, "-pix_fmt", "yuv420p"]
 
-        print(f"[RunPod] Encoder selecionado: {vcodec} ({preset_mode}) | {width}x{height} @ {fps}fps | {len(clips)} clipes | {len(audio_tracks)} áudios | CPUs: {os.cpu_count()}")
+        use_pil_subs = bool(HAS_PIL and HAS_OPENCV and subtitle_items)
+        print(f"[RunPod] Encoder selecionado: {vcodec} ({preset_mode}) | {width}x{height} @ {fps}fps | {len(clips)} clipes | {len(audio_tracks)} áudios | Legendas Canvas(PIL): {use_pil_subs} | CPUs: {os.cpu_count()}")
         _report_progress(job, 55, f"Baixando {len(clips)} mídias e {len(audio_tracks)} áudios...")
 
         # 1. Baixar todas as mídias e áudios em paralelo
@@ -1648,7 +2289,7 @@ def handler(job):
                 except Exception as dl_err:
                     print(f"[RunPod Warning] Falha ao baixar {kind} #{idx}: {dl_err}")
 
-        # Preparar arquivo de legendas antecipadamente para fundir na Etapa 2 ou 3b (elimina re-encode completo na Etapa 4!)
+        # Preparar arquivo de legendas antecipadamente (.ASS/.SRT fallback + lista estruturada Pillow Canvas-idêntica)
         sub_file_path = None
         sub_filter = None
         sub_intervals: list[tuple[float, float]] = []
@@ -1667,7 +2308,19 @@ def handler(job):
             sub_intervals = _parse_subtitle_intervals(sub_file_path)
 
         has_char_overlays = bool(character_overlays)
-        burn_subs_in_clips = bool(sub_filter and not has_char_overlays)
+        has_any_subs = bool(use_pil_subs or sub_filter)
+        burn_subs_in_clips = bool(has_any_subs and not has_char_overlays)
+
+        def _get_overlapping_pil_subs(s_win: float, e_win: float) -> list[dict]:
+            if not use_pil_subs:
+                return []
+            res = []
+            for it in subtitle_items:
+                st_i = float(it.get("start") or 0.0)
+                en_i = max(st_i + 0.05, float(it.get("end") or (st_i + 1.0)))
+                if en_i > s_win and st_i < e_win:
+                    res.append(it)
+            return res
 
         # 2. Renderizar cada clipe individualmente em multiprocesso (sem GIL!)
         segment_files = []
@@ -1675,14 +2328,40 @@ def handler(job):
 
         if intro_dur > 0:
             black_seg = os.path.join(work_dir, "seg_0000_black.mp4")
-            intro_cmd = [
-                "ffmpeg", "-y", "-loglevel", "error",
-                "-f", "lavfi", "-i", f"color=c=black:s={width}x{height}:r={fps}:d={intro_dur:.3f}",
-            ]
-            if burn_subs_in_clips and _clip_has_subtitles(0.0, intro_dur, sub_intervals):
-                intro_cmd.extend(["-vf", sub_filter])
-            intro_cmd.extend([*v_enc_args, "-an", black_seg])
-            run_cmd(intro_cmd, "Gerar tela preta inicial")
+            intro_pil_subs = _get_overlapping_pil_subs(0.0, intro_dur) if burn_subs_in_clips else []
+            if intro_pil_subs:
+                pil_ov = _prepare_clip_pil_overlays(intro_pil_subs, subtitle_config, width, height)
+                use_yuv_i = (width % 2 == 0 and height % 2 == 0)
+                n_ifrm = max(2, int(round(intro_dur * fps)))
+                proc_i, err_c_i, err_t_i = _start_ffmpeg_pipe([
+                    "ffmpeg", "-y", "-f", "rawvideo", "-pix_fmt", "yuv420p" if use_yuv_i else "bgr24",
+                    "-s", f"{width}x{height}", "-r", str(fps), "-i", "pipe:0", *v_enc_args, "-an", black_seg
+                ])
+                try:
+                    blk_i = np.zeros((height, width, 3), dtype=np.uint8)
+                    blk_yuv_i = cv2.cvtColor(blk_i, cv2.COLOR_BGR2YUV_I420) if use_yuv_i else None
+                    for fi in range(n_ifrm):
+                        ct_i = fi / float(fps)
+                        act_i = _find_active_pil_overlay(pil_ov, ct_i)
+                        if act_i is None and blk_yuv_i is not None:
+                            proc_i.stdin.write(memoryview(blk_yuv_i))
+                        elif act_i is None:
+                            proc_i.stdin.write(memoryview(blk_i))
+                        else:
+                            frm_i = blk_i.copy()
+                            _stamp_pil_subtitle(frm_i, act_i[2], ct_i, act_i[0], act_i[1])
+                            _write_raw_frame(proc_i.stdin, frm_i, use_yuv_i)
+                finally:
+                    _close_and_wait_ffmpeg(proc_i, err_c_i, err_t_i, "Erro tela preta inicial")
+            else:
+                intro_cmd = [
+                    "ffmpeg", "-y", "-loglevel", "error",
+                    "-f", "lavfi", "-i", f"color=c=black:s={width}x{height}:r={fps}:d={intro_dur:.3f}",
+                ]
+                if burn_subs_in_clips and sub_filter and _clip_has_subtitles(0.0, intro_dur, sub_intervals):
+                    intro_cmd.extend(["-vf", sub_filter])
+                intro_cmd.extend([*v_enc_args, "-an", black_seg])
+                run_cmd(intro_cmd, "Gerar tela preta inicial")
             segment_files.append(black_seg)
 
         clip_tasks = []
@@ -1690,7 +2369,10 @@ def handler(job):
         for idx, clip in enumerate(clips):
             dur = max(0.2, float(clip.get("duration", 3.0)))
             clip_end = t_cursor + dur
-            needs_sub = burn_subs_in_clips and _clip_has_subtitles(t_cursor, clip_end, sub_intervals)
+            pil_for_clip = _get_overlapping_pil_subs(t_cursor, clip_end) if burn_subs_in_clips else []
+            needs_sub = burn_subs_in_clips and (
+                bool(pil_for_clip) or _clip_has_subtitles(t_cursor, clip_end, sub_intervals)
+            )
             clip_tasks.append((
                 idx,
                 clip,
@@ -1705,12 +2387,14 @@ def handler(job):
                 t_cursor,
                 sub_filter if burn_subs_in_clips else None,
                 needs_sub,
+                pil_for_clip,
+                subtitle_config,
             ))
             t_cursor = clip_end
 
         cpu_cnt = os.cpu_count() or 4
         clip_workers = min(8, max(3, cpu_cnt)) if use_nvenc else min(4, max(2, cpu_cnt // 2))
-        print(f"[RunPod] Renderizando {len(clips)} clipes com {clip_workers} processos paralelos (legendas no passe dos clipes: {burn_subs_in_clips})")
+        print(f"[RunPod] Renderizando {len(clips)} clipes com {clip_workers} processos paralelos (legendas no passe dos clipes: {burn_subs_in_clips} | modo PIL: {use_pil_subs})")
 
         rendered_by_idx = {}
         done_count = 0
@@ -1766,7 +2450,7 @@ def handler(job):
             visual_video_path
         ], "Concatenar segmentos visuais")
 
-        # 3b. Aplicar overlays de personagem (e legendas no mesmo passe se houver personagens)
+        # 3b. Aplicar overlays de personagem (e legendas Pillow Canvas-idênticas no mesmo passe se houver personagens)
         subs_already_burned = burn_subs_in_clips
         if character_overlays:
             _report_progress(job, 92, "Aplicando personagens e legendas na GPU...")
@@ -1822,8 +2506,10 @@ def handler(job):
                         fps,
                         v_enc_args,
                         sub_filter=sub_filter,
+                        subtitle_items=subtitle_items,
+                        subtitle_config=subtitle_config,
                     )
-                    if sub_filter:
+                    if has_any_subs:
                         subs_already_burned = True
                 else:
                     c_cmd = ["ffmpeg", "-y", "-i", visual_video_path]
@@ -1874,17 +2560,32 @@ def handler(job):
 
         # 4. Fallback de legendas apenas caso existam legendas e não tenham sido queimadas nas etapas anteriores
         subtitled_video_path = visual_video_path
-        if sub_filter and not subs_already_burned:
+        if has_any_subs and not subs_already_burned:
             _report_progress(job, 94, "Queimando legendas no vídeo...")
             subtitled_video_path = os.path.join(work_dir, "visual_subtitled.mp4")
-            run_cmd([
-                "ffmpeg", "-y",
-                "-i", visual_video_path,
-                "-vf", sub_filter,
-                *v_enc_args,
-                "-an",
-                subtitled_video_path
-            ], "Queimar legendas no vídeo")
+            if use_pil_subs:
+                composite_characters_opencv(
+                    visual_video_path,
+                    subtitled_video_path,
+                    [],
+                    {},
+                    width,
+                    height,
+                    fps,
+                    v_enc_args,
+                    sub_filter=None,
+                    subtitle_items=subtitle_items,
+                    subtitle_config=subtitle_config,
+                )
+            elif sub_filter:
+                run_cmd([
+                    "ffmpeg", "-y",
+                    "-i", visual_video_path,
+                    "-vf", sub_filter,
+                    *v_enc_args,
+                    "-an",
+                    subtitled_video_path
+                ], "Queimar legendas no vídeo")
 
         _report_progress(job, 96, "Mixando áudios e finalizando MP4...")
 
